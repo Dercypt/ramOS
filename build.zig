@@ -46,7 +46,16 @@ pub fn build(b: *std.Build) void {
 
     const run_zstd_tests = b.addRunArtifact(zstd_tests);
 
+    const ring_tests = b.addTest(.{
+        .root_source_file = b.path("src/ring.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = optimize,
+    });
+
+    const run_ring_tests = b.addRunArtifact(ring_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_slab_tests.step);
     test_step.dependOn(&run_zstd_tests.step);
+    test_step.dependOn(&run_ring_tests.step);
 }
