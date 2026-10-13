@@ -16,5 +16,35 @@ for term in "${BANNED_AARCH64_INSTRUCTIONS[@]}"; do
     fi
 done
 
-echo "OK: Flat address space invariant verified (no TTBR/TLBI register switching in src/)."
+# Invariant Test: Phase 5 Single Flat Space Task Switcher
+if [ ! -f "src/task.zig" ]; then
+    echo "ERROR: src/task.zig missing. Phase 5 green thread task switcher must be implemented."
+    exit 1
+fi
+
+if ! grep -q "TaskContext" src/task.zig; then
+    echo "ERROR: TaskContext register save/restore structure must be defined in src/task.zig."
+    exit 1
+fi
+
+if ! grep -q "Scheduler" src/task.zig; then
+    echo "ERROR: Scheduler must be defined in src/task.zig."
+    exit 1
+fi
+
+if ! grep -q "switchContext" src/task.zig; then
+    echo "ERROR: switchContext must be implemented for cooperative green threads in src/task.zig."
+    exit 1
+fi
+
+if ! grep -q "taskEntryTrampoline" src/task.zig; then
+    echo "ERROR: taskEntryTrampoline must be implemented in src/task.zig."
+    exit 1
+fi
+
+if command -v zig >/dev/null 2>&1; then
+    zig test src/task.zig
+fi
+
+echo "OK: Flat address space and task switcher invariants verified in src/task.zig."
 exit 0
