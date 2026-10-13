@@ -2,6 +2,7 @@ const limine = @import("limine.zig");
 const memory = @import("memory.zig");
 const zstd = @import("zstd.zig");
 const ring = @import("ring.zig");
+const task = @import("task.zig");
 
 // Limine base revision declaration
 export var base_revision: limine.BaseRevision linksection(".requests") = .{};
@@ -127,6 +128,21 @@ export fn _start() callconv(.C) noreturn {
     uartPrint("[ramOS] Compression Ring self-tests passed successfully.\r\n");
 
     uartPrint("[ramOS] Phase 4 initialization complete. In-Memory Compression Ring operational.\r\n");
+    uartPrint("\r\n");
+
+    uartPrint("[ramOS] Initializing Single Flat Space Task Switcher (Phase 5)...\r\n");
+    task.global_scheduler.init();
+    uartPrint("[ramOS] Primary task initialized: kernel_main (ID 0).\r\n");
+    uartPrint("[ramOS] Flat Address Space Green Threads capacity: ");
+    uartPrintU64(task.MAX_TASKS);
+    uartPrint(" tasks (Zero TLB flushes)\r\n");
+
+    uartPrint("[ramOS] Running Single Flat Space Task Switcher self-tests...\r\n");
+    testTaskSwitcher();
+    uartPrint("[ramOS] Task Switcher self-tests passed successfully.\r\n");
+
+    uartPrint("[ramOS] Phase 5 initialization complete. Green thread task switcher operational.\r\n");
+    uartPrint("[ramOS] All Phase 1-5 subsystems fully verified in single flat 64-bit space.\r\n");
 
     hang();
 }
@@ -331,6 +347,73 @@ fn testCompressionRing() void {
     for (&cold_batch) |*cp| {
         cp.deallocate(&memory.global_pmm, &memory.slab.global_slab);
     }
+}
+
+// Global state tracking task switcher self-test execution
+var test_task_counter: u64 = 0;
+var test_task_finished: bool = false;
+
+fn workerTaskA(arg: u64) void {
+    test_task_counter += arg;
+    // Cooperatively yield back to scheduler
+    task.global_scheduler.yield();
+    test_task_counter += 1;
+}
+
+fn workerTaskB(arg: u64) void {
+    test_task_counter += arg;
+    test_task_finished = true;
+}
+
+fn testTaskSwitcher() void {
+    // 1. Verify scheduler state and primary task
+    if (!task.global_scheduler.initialized) @panic("Scheduler not initialized");
+    if (task.global_scheduler.getCurrentTask() == null) @panic("No current task");
+    if (task.global_scheduler.task_count != 1) @panic("Task count mismatch after init");
+
+    const cur = task.global_scheduler.getCurrentTask().?;
+    if (cur.id != 0) @panic("Primary task ID is not 0");
+    if (cur.state != .running) @panic("Primary task state is not running");
+
+    // 2. Spawn worker tasks in the single flat address space
+    test_task_counter = 0;
+    test_task_finished = false;
+
+    const t1_id = task.global_scheduler.spawn(
+        &memory.global_pmm,
+        workerTaskA,
+        100,
+        "worker_a",
+    ) orelse @panic("Failed to spawn workerTaskA");
+
+    const t2_id = task.global_scheduler.spawn(
+        &memory.global_pmm,
+        workerTaskB,
+        200,
+        "worker_b",
+    ) orelse @panic("Failed to spawn workerTaskB");
+
+    if (task.global_scheduler.task_count != 3) @panic("Task count mismatch after spawning workers");
+
+    const t1 = task.global_scheduler.getTaskById(t1_id) orelse @panic("Worker A not found");
+    const t2 = task.global_scheduler.getTaskById(t2_id) orelse @panic("Worker B not found");
+
+    if (t1.state != .ready or t2.state != .ready) @panic("Worker tasks not initialized to ready state");
+    if (t1.context.sp == 0 or t2.context.sp == 0) @panic("Worker stacks uninitialized");
+    if ((t1.context.sp & 15) != 0 or (t2.context.sp & 15) != 0) @panic("Worker stack pointers misaligned");
+
+    // 3. Test cooperative context switching
+    // Yielding from primary task (kernel_main) switches execution to workerTaskA
+    task.global_scheduler.yield();
+
+    // After round-robin execution through workers and back to primary:
+    // workerTaskA added 100, yielded to workerTaskB which added 200 and completed,
+    // workerTaskA resumed, added 1 and completed, then control returned to primary task.
+    if (test_task_counter < 301) @panic("Worker tasks did not complete expected execution increments");
+    if (!test_task_finished) @panic("Worker tasks did not finish flag");
+
+    // 4. Verify context switch counter incremented
+    if (task.global_scheduler.getSwitchCount() == 0) @panic("Context switch count zero");
 }
 
 fn hang() noreturn {
