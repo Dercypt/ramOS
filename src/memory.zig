@@ -1,4 +1,5 @@
 const limine = @import("limine.zig");
+pub const slab = @import("slab.zig");
 
 pub const PAGE_SIZE: usize = 4096;
 
@@ -13,6 +14,19 @@ pub const FrameMeta = struct {
     state: PageState = .free,
     ref_count: u32 = 0,
     compressed_handle: u32 = 0, // Points into the Zstd slab pool if compressed
+
+    pub fn setCompressed(self: *FrameMeta, handle: slab.PageHandle) void {
+        self.state = .compressed;
+        self.compressed_handle = handle.id;
+    }
+
+    pub fn getCompressedHandle(self: *const FrameMeta) slab.PageHandle {
+        return slab.PageHandle.fromU32(self.compressed_handle);
+    }
+
+    pub fn isCompressed(self: *const FrameMeta) bool {
+        return self.state == .compressed and self.compressed_handle != 0;
+    }
 };
 
 pub const PhysicalMemoryManager = struct {
@@ -154,33 +168,72 @@ pub const PhysicalMemoryManager = struct {
         return (self.bitmap[byte_idx] & (@as(u8, 1) << bit_idx)) != 0;
     }
 
-    /// Allocate a single 4 KiB physical frame
-    pub fn allocFrame(self: *PhysicalMemoryManager) ?u64 {
-        var frame_idx: u64 = 0;
-        while (frame_idx < self.total_frames) : (frame_idx += 1) {
-            if (!self.isBitSet(frame_idx)) {
-                self.setBit(frame_idx, true);
-                self.free_frames -= 1;
-                self.frame_table[frame_idx].state = .active;
-                self.frame_table[frame_idx].ref_count = 1;
-                return frame_idx * PAGE_SIZE;
+    /// Allocate contiguous physical frames with specified frame alignment (in frame units)
+    pub fn allocContiguousFrames(self: *PhysicalMemoryManager, count: usize, alignment: usize) ?u64 {
+        if (count == 0) return null;
+        if (self.free_frames < count) return null;
+
+        const align_val = if (alignment == 0) 1 else alignment;
+        var frame_idx: usize = 0;
+        while (frame_idx + count <= self.total_frames) {
+            const rem = frame_idx % align_val;
+            if (rem != 0) {
+                frame_idx += align_val - rem;
+                continue;
+            }
+
+            var all_free = true;
+            var offset: usize = 0;
+            while (offset < count) : (offset += 1) {
+                if (self.isBitSet(@intCast(frame_idx + offset))) {
+                    all_free = false;
+                    frame_idx += offset + 1;
+                    break;
+                }
+            }
+
+            if (all_free) {
+                var i: usize = 0;
+                while (i < count) : (i += 1) {
+                    const idx = frame_idx + i;
+                    self.setBit(@intCast(idx), true);
+                    self.frame_table[idx].state = .active;
+                    self.frame_table[idx].ref_count = 1;
+                    self.frame_table[idx].compressed_handle = 0;
+                }
+                self.free_frames -= count;
+                return @as(u64, @intCast(frame_idx)) * PAGE_SIZE;
             }
         }
         return null;
     }
 
+    /// Allocate a single 4 KiB physical frame
+    pub fn allocFrame(self: *PhysicalMemoryManager) ?u64 {
+        return self.allocContiguousFrames(1, 1);
+    }
+
+    /// Free contiguous physical frames
+    pub fn freeContiguousFrames(self: *PhysicalMemoryManager, phys: u64, count: usize) void {
+        const start_idx = phys / PAGE_SIZE;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const frame_idx = start_idx + i;
+            if (frame_idx >= self.total_frames) break;
+
+            if (self.isBitSet(frame_idx)) {
+                self.setBit(frame_idx, false);
+                self.free_frames += 1;
+                self.frame_table[frame_idx].state = .free;
+                self.frame_table[frame_idx].ref_count = 0;
+                self.frame_table[frame_idx].compressed_handle = 0;
+            }
+        }
+    }
+
     /// Free a previously allocated physical frame
     pub fn freeFrame(self: *PhysicalMemoryManager, phys: u64) void {
-        const frame_idx = phys / PAGE_SIZE;
-        if (frame_idx >= self.total_frames) return;
-
-        if (self.isBitSet(frame_idx)) {
-            self.setBit(frame_idx, false);
-            self.free_frames += 1;
-            self.frame_table[frame_idx].state = .free;
-            self.frame_table[frame_idx].ref_count = 0;
-            self.frame_table[frame_idx].compressed_handle = 0;
-        }
+        self.freeContiguousFrames(phys, 1);
     }
 
     pub fn isLowMemory(self: *const PhysicalMemoryManager) bool {
