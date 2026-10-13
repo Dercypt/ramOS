@@ -7,7 +7,11 @@ pub fn build(b: *std.Build) void {
         .abi = .none,
     });
 
-    const optimize = b.standardOptimizeOption(.{
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    ) orelse b.standardOptimizeOption(.{
         .preferred_optimize_mode = .ReleaseSafe,
     });
 
@@ -25,4 +29,14 @@ pub fn build(b: *std.Build) void {
 
     const kernel_step = b.step("kernel", "Build the ramOS AArch64 kernel");
     kernel_step.dependOn(&b.addInstallArtifact(kernel, .{}).step);
+
+    const slab_tests = b.addTest(.{
+        .root_source_file = b.path("src/slab.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = optimize,
+    });
+
+    const run_slab_tests = b.addRunArtifact(slab_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_slab_tests.step);
 }
