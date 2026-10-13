@@ -1,5 +1,6 @@
 const limine = @import("limine.zig");
 const memory = @import("memory.zig");
+const zstd = @import("zstd.zig");
 
 // Limine base revision declaration
 export var base_revision: limine.BaseRevision linksection(".requests") = .{};
@@ -92,7 +93,90 @@ export fn _start() callconv(.C) noreturn {
 
     uartPrint("[ramOS] Phase 2 initialization complete. In-RAM Slab Pool operational.\r\n");
 
+    uartPrint("[ramOS] Initializing bare-metal Zstandard Compression Engine (Phase 3)...\r\n");
+    uartPrint("[ramOS] Zstd Static CCtx initialized: ");
+    uartPrintU64(zstd.ZSTD_estimateCCtxSize(1) / 1024);
+    uartPrint(" KiB static workspace\r\n");
+    uartPrint("[ramOS] Zstd Static DCtx initialized: ");
+    uartPrintU64(zstd.ZSTD_estimateDCtxSize() / 1024);
+    uartPrint(" KiB static workspace\r\n");
+
+    uartPrint("[ramOS] Running Zstandard Compression Engine self-tests...\r\n");
+    testZstdCompression();
+    uartPrint("[ramOS] Zstandard Compression self-tests passed successfully.\r\n");
+
+    uartPrint("[ramOS] Phase 3 initialization complete. Bare-metal Zstd engine operational.\r\n");
+
     hang();
+}
+
+fn testZstdCompression() void {
+    // 1. Test compression of a 4096-byte zeroed frame into slab pool
+    var zero_page: [memory.PAGE_SIZE]u8 = undefined;
+    @memset(&zero_page, 0);
+
+    const zero_handle = memory.slab.global_slab.compressAndStore(&zero_page) orelse @panic("Failed to compress zeroed frame");
+    if (!zero_handle.isValid()) @panic("Invalid zeroed page handle");
+
+    const zero_comp_slice = memory.slab.global_slab.getCompressed(zero_handle) orelse @panic("Failed to get compressed zero slice");
+    // Verify RLE frame is 11 bytes (compression ratio ~372x)
+    if (zero_comp_slice.len != 11) @panic("Unexpected compressed size for zeroed page");
+
+    var decomp_page: [memory.PAGE_SIZE]u8 = undefined;
+    const decomp_len = memory.slab.global_slab.decompressToFrame(zero_handle, &decomp_page) catch @panic("Failed to decompress zeroed frame");
+    if (decomp_len != memory.PAGE_SIZE) @panic("Decompressed zero frame length mismatch");
+
+    for (decomp_page) |b| {
+        if (b != 0) @panic("Decompressed zero frame content corrupted");
+    }
+    memory.slab.global_slab.freeCompressed(zero_handle);
+
+    // 2. Test compression and decompression of a patterned frame
+    var pattern_page: [memory.PAGE_SIZE]u8 = undefined;
+    @memset(pattern_page[0..1000], 'R');
+    @memset(pattern_page[1000..3000], 0);
+    @memcpy(pattern_page[3000..3023], "ramOS Zstandard Phase 3");
+    @memset(pattern_page[3023..4096], 'Z');
+
+    const pat_handle = memory.slab.global_slab.compressAndStore(&pattern_page) orelse @panic("Failed to compress pattern frame");
+    const pat_comp_slice = memory.slab.global_slab.getCompressed(pat_handle) orelse @panic("Failed to get pattern slice");
+    if (pat_comp_slice.len >= memory.PAGE_SIZE) @panic("Pattern frame failed to achieve compression");
+
+    const pat_decomp_len = memory.slab.global_slab.decompressToFrame(pat_handle, &decomp_page) catch @panic("Failed to decompress pattern frame");
+    if (pat_decomp_len != memory.PAGE_SIZE) @panic("Decompressed pattern length mismatch");
+
+    for (pattern_page, 0..) |expected_byte, i| {
+        if (decomp_page[i] != expected_byte) @panic("Decompressed pattern content mismatch");
+    }
+    memory.slab.global_slab.freeCompressed(pat_handle);
+
+    // 3. Test direct ZSTD C-compatible API with static contexts
+    const cctx = memory.slab.global_slab.cctx orelse @panic("CCtx not initialized");
+    const dctx = memory.slab.global_slab.dctx orelse @panic("DCtx not initialized");
+
+    const test_str = "ramOS flat address space with bare-metal Zstandard compression engine.";
+    var comp_direct: [128]u8 = undefined;
+    const comp_direct_len = zstd.ZSTD_compressCCtx(cctx, &comp_direct, test_str, 1) catch @panic("ZSTD_compressCCtx failed");
+
+    var decomp_direct: [128]u8 = undefined;
+    const decomp_direct_len = zstd.ZSTD_decompressDCtx(dctx, &decomp_direct, comp_direct[0..comp_direct_len]) catch @panic("ZSTD_decompressDCtx failed");
+    if (decomp_direct_len != test_str.len) @panic("Direct decompressed length mismatch");
+
+    for (test_str, 0..) |expected, i| {
+        if (decomp_direct[i] != expected) @panic("Direct decompressed content mismatch");
+    }
+
+    // 4. Test frame table integration with compressed handle
+    const frame_phys = memory.global_pmm.allocFrame() orelse @panic("Failed to alloc physical frame");
+    const frame_idx = frame_phys / memory.PAGE_SIZE;
+    const meta_handle = memory.slab.global_slab.compressAndStore(&zero_page) orelse @panic("Failed to compress for frame meta");
+    memory.global_pmm.frame_table[frame_idx].setCompressed(meta_handle);
+
+    if (!memory.global_pmm.frame_table[frame_idx].isCompressed()) @panic("FrameMeta not marked as compressed");
+    if (memory.global_pmm.frame_table[frame_idx].getCompressedHandle().id != meta_handle.id) @panic("FrameMeta handle mismatch");
+
+    memory.slab.global_slab.freeCompressed(meta_handle);
+    memory.global_pmm.freeFrame(frame_phys);
 }
 
 fn testSlabAllocator() void {
