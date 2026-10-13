@@ -1,6 +1,7 @@
 const limine = @import("limine.zig");
 const memory = @import("memory.zig");
 const zstd = @import("zstd.zig");
+const ring = @import("ring.zig");
 
 // Limine base revision declaration
 export var base_revision: limine.BaseRevision linksection(".requests") = .{};
@@ -106,6 +107,26 @@ export fn _start() callconv(.C) noreturn {
     uartPrint("[ramOS] Zstandard Compression self-tests passed successfully.\r\n");
 
     uartPrint("[ramOS] Phase 3 initialization complete. Bare-metal Zstd engine operational.\r\n");
+    uartPrint("\r\n");
+
+    uartPrint("[ramOS] Initializing In-Memory Compression Ring & Watermark Eviction (Phase 4)...\r\n");
+    ring.global_ring.init(&memory.global_pmm, &memory.slab.global_slab);
+
+    uartPrint("[ramOS] Compression Ring Capacity: ");
+    uartPrintU64(ring.global_ring.capacity);
+    uartPrint(" entries (lockless circular buffer)\r\n");
+
+    uartPrint("[ramOS] Synchronous Eviction configured: Watermark Low = ");
+    uartPrintU64(memory.global_pmm.watermark_low);
+    uartPrint(" | High = ");
+    uartPrintU64(memory.global_pmm.watermark_high);
+    uartPrint(" frames\r\n");
+
+    uartPrint("[ramOS] Running In-Memory Compression Ring self-tests...\r\n");
+    testCompressionRing();
+    uartPrint("[ramOS] Compression Ring self-tests passed successfully.\r\n");
+
+    uartPrint("[ramOS] Phase 4 initialization complete. In-Memory Compression Ring operational.\r\n");
 
     hang();
 }
@@ -215,6 +236,101 @@ fn testSlabAllocator() void {
     // Clean up
     memory.slab.global_slab.freeCompressed(handle);
     memory.global_pmm.freeFrame(frame_phys);
+}
+
+fn testCompressionRing() void {
+    // 1. Test ManagedPage lifecycle state transitions
+    const phys1 = memory.global_pmm.allocFrame() orelse @panic("Failed to allocate physical frame for ManagedPage test");
+    var page = ring.ManagedPage.initActive(phys1);
+    if (!page.isActive()) @panic("ManagedPage not active after initialization");
+
+    const virt1: [*]u8 = memory.global_pmm.physToVirt(phys1);
+    @memset(virt1[0..1000], 'C');
+    @memset(virt1[1000..3000], 0);
+    @memcpy(virt1[3000..3022], "ramOS Phase 4 Eviction");
+    @memset(virt1[3022..4096], 'E');
+
+    // Transition Active -> Cold
+    if (!page.markCold(&memory.global_pmm)) @panic("Failed to mark ManagedPage as cold");
+    if (!page.isCold()) @panic("ManagedPage state is not cold");
+
+    // Transition Cold -> Compressing -> Compressed
+    const handle = page.compress(&memory.global_pmm, &memory.slab.global_slab) catch @panic("Failed to compress ManagedPage");
+    if (!handle.isValid()) @panic("Invalid compressed page handle returned");
+    if (!page.isCompressed()) @panic("ManagedPage state is not compressed");
+    if (page.phys_addr != 0) @panic("Compressed ManagedPage physical address must be cleared");
+
+    // Transition Compressed -> Decompressing -> Active
+    const restored_virt = page.access(&memory.global_pmm, &memory.slab.global_slab) catch @panic("Failed to access compressed page");
+    if (!page.isActive()) @panic("ManagedPage not active after access");
+    if (page.phys_addr == 0) @panic("ManagedPage physical address not assigned after access");
+
+    // Verify data integrity
+    if (restored_virt[0] != 'C') @panic("Corrupted byte in restored ManagedPage");
+    if (restored_virt[1500] != 0) @panic("Corrupted zero byte in restored ManagedPage");
+    const label = restored_virt[3000..3022];
+    const expected_label = "ramOS Phase 4 Eviction";
+    for (expected_label, 0..) |b, i| {
+        if (label[i] != b) @panic("Label mismatch in decompressed page");
+    }
+    if (restored_virt[4000] != 'E') @panic("Corrupted tail byte in restored ManagedPage");
+
+    // Transition Active -> Free
+    page.deallocate(&memory.global_pmm, &memory.slab.global_slab);
+    if (page.state != .free) @panic("ManagedPage not free after deallocation");
+
+    // 2. Test Lockless Circular Compression Ring enqueue and dequeue
+    const phys2 = memory.global_pmm.allocFrame() orelse @panic("Failed to allocate physical frame for ring test");
+    const v2: [*]u8 = memory.global_pmm.physToVirt(phys2);
+    @memset(v2[0..memory.PAGE_SIZE], 'R');
+    var ring_page = ring.ManagedPage.initActive(phys2);
+    _ = ring_page.markCold(&memory.global_pmm);
+
+    const enqueued = ring.global_ring.enqueueManagedPage(&ring_page);
+    if (!enqueued) @panic("Failed to enqueue cold page into compression ring");
+
+    // Evict via global compression ring
+    const evicted_entry = ring.global_ring.evictOne(&memory.global_pmm, &memory.slab.global_slab) orelse @panic("Failed to evict cold page from compression ring");
+    if (evicted_entry.status != .compressed) @panic("Evicted entry status is not compressed");
+    if (!ring_page.isCompressed()) @panic("Ring page state is not compressed");
+
+    // Restore page and clean up
+    _ = ring_page.access(&memory.global_pmm, &memory.slab.global_slab) catch @panic("Failed to restore ring page");
+    ring_page.deallocate(&memory.global_pmm, &memory.slab.global_slab);
+
+    // 3. Test Synchronous Watermark Eviction Path
+    // Pre-allocate a set of cold pages to be evicted when watermark is breached
+    var cold_batch: [4]ring.ManagedPage = undefined;
+    for (&cold_batch) |*cp| {
+        const p = memory.global_pmm.allocFrame() orelse @panic("Failed to allocate batch frame");
+        const v: [*]u8 = memory.global_pmm.physToVirt(p);
+        @memset(v[0..memory.PAGE_SIZE], 'W');
+        cp.* = ring.ManagedPage.initActive(p);
+        _ = cp.markCold(&memory.global_pmm);
+        _ = ring.global_ring.enqueueManagedPage(cp);
+    }
+
+    // Temporarily trigger watermark condition
+    const original_low = memory.global_pmm.watermark_low;
+    const original_high = memory.global_pmm.watermark_high;
+
+    memory.global_pmm.watermark_high = memory.global_pmm.free_frames + 2;
+    memory.global_pmm.watermark_low = memory.global_pmm.free_frames;
+
+    // Allocation should detect free_frames <= watermark_low and trigger synchronous eviction
+    const triggered_frame = memory.global_pmm.allocFrame() orelse @panic("Synchronous eviction allocation failed");
+    if (memory.global_pmm.free_frames < memory.global_pmm.watermark_high - 1) {
+        @panic("Free frames not replenished by synchronous eviction");
+    }
+
+    // Restore original watermarks and clean up
+    memory.global_pmm.watermark_low = original_low;
+    memory.global_pmm.watermark_high = original_high;
+
+    memory.global_pmm.freeFrame(triggered_frame);
+    for (&cold_batch) |*cp| {
+        cp.deallocate(&memory.global_pmm, &memory.slab.global_slab);
+    }
 }
 
 fn hang() noreturn {
