@@ -1,4 +1,5 @@
 const memory = @import("memory.zig");
+pub const zstd = @import("zstd.zig");
 
 /// Fixed slab block size: 64 KiB (16 x 4 KiB physical frames)
 pub const SLAB_BLOCK_SIZE: usize = 64 * 1024;
@@ -326,6 +327,8 @@ pub const SlabAllocator = struct {
     caches: [NUM_SIZE_CLASSES]SlabCache = undefined,
     handle_mgr: PageHandleManager = .{},
     scratch_arena: ScratchArena = .{},
+    cctx: ?*zstd.ZSTD_CCtx = null,
+    dctx: ?*zstd.ZSTD_DCtx = null,
     initialized: bool = false,
 
     pub fn init(self: *SlabAllocator, pmm: *memory.PhysicalMemoryManager) void {
@@ -343,6 +346,16 @@ pub const SlabAllocator = struct {
         const SCRATCH_ARENA_SIZE: usize = 256 * 1024;
         if (!self.scratch_arena.init(pmm, SCRATCH_ARENA_SIZE)) {
             @panic("Failed to allocate Zstd fixed scratch arena");
+        }
+
+        // Initialize pre-allocated Zstandard compression and decompression contexts in static scratch arena
+        const scratch_slice = self.scratch_arena.getSlice();
+        const half = scratch_slice.len / 2;
+        self.cctx = zstd.ZSTD_initStaticCCtx(scratch_slice[0..half]);
+        self.dctx = zstd.ZSTD_initStaticDCtx(scratch_slice[half..]);
+
+        if (self.cctx == null or self.dctx == null) {
+            @panic("Failed to initialize static Zstd contexts");
         }
 
         self.initialized = true;
@@ -381,6 +394,21 @@ pub const SlabAllocator = struct {
         if (self.handle_mgr.freeHandle(handle)) |entry| {
             self.caches[entry.class_idx].free(self.pmm, entry.ptr);
         }
+    }
+
+    /// Synchronously compress an uncompressed 4 KiB frame and store the compressed payload into the slab pool
+    pub fn compressAndStore(self: *SlabAllocator, frame_data: []const u8) ?PageHandle {
+        const cctx = self.cctx orelse return null;
+        var comp_buf: [zstd.ZSTD_compressBound(memory.PAGE_SIZE)]u8 = undefined;
+        const comp_len = cctx.compress(&comp_buf, frame_data, 1) catch return null;
+        return self.allocCompressed(comp_buf[0..comp_len]);
+    }
+
+    /// Retrieve and decompress a compressed page payload back into a 4 KiB destination frame
+    pub fn decompressToFrame(self: *const SlabAllocator, handle: PageHandle, dest_frame: []u8) !usize {
+        const dctx = self.dctx orelse return error.ContextNotInitialized;
+        const comp_slice = self.getCompressed(handle) orelse return error.InvalidHandle;
+        return dctx.decompress(dest_frame, comp_slice);
     }
 
     /// Total active slab blocks across all size caches
