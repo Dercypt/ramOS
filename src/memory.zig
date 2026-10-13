@@ -7,7 +7,9 @@ pub const PageState = enum(u8) {
     free = 0,
     active = 1,
     cold = 2,
-    compressed = 3,
+    compressing = 3,
+    compressed = 4,
+    decompressing = 5,
 };
 
 pub const FrameMeta = struct {
@@ -27,6 +29,28 @@ pub const FrameMeta = struct {
     pub fn isCompressed(self: *const FrameMeta) bool {
         return self.state == .compressed and self.compressed_handle != 0;
     }
+
+    pub fn setCold(self: *FrameMeta) void {
+        self.state = .cold;
+    }
+
+    pub fn setActive(self: *FrameMeta) void {
+        self.state = .active;
+    }
+
+    pub fn setCompressing(self: *FrameMeta) void {
+        self.state = .compressing;
+    }
+
+    pub fn setDecompressing(self: *FrameMeta) void {
+        self.state = .decompressing;
+    }
+
+    pub fn setFree(self: *FrameMeta) void {
+        self.state = .free;
+        self.ref_count = 0;
+        self.compressed_handle = 0;
+    }
 };
 
 pub const PhysicalMemoryManager = struct {
@@ -35,6 +59,8 @@ pub const PhysicalMemoryManager = struct {
     free_frames: usize = 0,
     watermark_low: usize = 0,
     watermark_high: usize = 0,
+    evict_fn: ?*const fn (*PhysicalMemoryManager, usize) usize = null,
+    is_evicting: bool = false,
 
     // Bitmap for 4 KiB frame allocation
     bitmap: [*]u8 = undefined,
@@ -168,9 +194,48 @@ pub const PhysicalMemoryManager = struct {
         return (self.bitmap[byte_idx] & (@as(u8, 1) << bit_idx)) != 0;
     }
 
+    pub fn setEvictor(self: *PhysicalMemoryManager, evict_fn: *const fn (*PhysicalMemoryManager, usize) usize) void {
+        self.evict_fn = evict_fn;
+    }
+
+    pub fn triggerEviction(self: *PhysicalMemoryManager, target_free: usize) usize {
+        if (self.is_evicting) return 0;
+        if (self.evict_fn) |evict| {
+            self.is_evicting = true;
+            defer self.is_evicting = false;
+            return evict(self, target_free);
+        }
+        return 0;
+    }
+
+    pub fn markFrameCold(self: *PhysicalMemoryManager, frame_idx: usize) bool {
+        if (frame_idx >= self.total_frames) return false;
+        if (self.frame_table[frame_idx].state == .active) {
+            self.frame_table[frame_idx].state = .cold;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn markCold(self: *PhysicalMemoryManager, phys: u64) bool {
+        return self.markFrameCold(phys / PAGE_SIZE);
+    }
+
+    pub fn isCold(self: *const PhysicalMemoryManager, frame_idx: usize) bool {
+        if (frame_idx >= self.total_frames) return false;
+        return self.frame_table[frame_idx].state == .cold;
+    }
+
     /// Allocate contiguous physical frames with specified frame alignment (in frame units)
     pub fn allocContiguousFrames(self: *PhysicalMemoryManager, count: usize, alignment: usize) ?u64 {
         if (count == 0) return null;
+
+        // Synchronous eviction path: if memory is low or insufficient for allocation,
+        // compress cold pages until free frames meet or exceed the high watermark.
+        if (!self.is_evicting and (self.free_frames <= self.watermark_low or self.free_frames < count)) {
+            _ = self.triggerEviction(self.watermark_high);
+        }
+
         if (self.free_frames < count) return null;
 
         const align_val = if (alignment == 0) 1 else alignment;
@@ -202,6 +267,12 @@ pub const PhysicalMemoryManager = struct {
                     self.frame_table[idx].compressed_handle = 0;
                 }
                 self.free_frames -= count;
+
+                // Synchronously evict if this allocation dropped free frames to or below the low watermark
+                if (!self.is_evicting and self.free_frames <= self.watermark_low) {
+                    _ = self.triggerEviction(self.watermark_high);
+                }
+
                 return @as(u64, @intCast(frame_idx)) * PAGE_SIZE;
             }
         }
