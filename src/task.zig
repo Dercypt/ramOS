@@ -88,6 +88,9 @@ pub const Scheduler = struct {
     task_count: usize = 0,
     initialized: bool = false,
     switch_count: u64 = 0,
+    zombie_task: ?TaskId = null,
+    pmm: ?*memory.PhysicalMemoryManager = null,
+    slab_alloc: ?*memory.slab.SlabAllocator = null,
 
     // Static stacks for mock/host testing if needed
     static_stacks: [MAX_TASKS][DEFAULT_STACK_SIZE]u8 align(16) = undefined,
@@ -97,6 +100,9 @@ pub const Scheduler = struct {
         self.next_task_id = 1;
         self.task_count = 0;
         self.switch_count = 0;
+        self.zombie_task = null;
+        self.pmm = null;
+        self.slab_alloc = null;
 
         for (&self.tasks) |*t| {
             t.* = .{};
@@ -152,6 +158,7 @@ pub const Scheduler = struct {
             }
         }
         const idx = slot_idx orelse return null;
+        self.pmm = pmm;
 
         // Allocate physical frames for stack
         const stack_phys = pmm.allocContiguousFrames(STACK_PAGE_COUNT, 1) orelse return null;
@@ -280,9 +287,42 @@ pub const Scheduler = struct {
             // Hosted test simulation
             cur_task.context.x19 = next.context.x19;
         }
+
+        // Resumed execution on next task's stack: free any deferred zombie stack
+        self.reclaimZombie(self.pmm orelse (if (builtin.os.tag == .freestanding) &memory.global_pmm else null), self.slab_alloc orelse (if (builtin.os.tag == .freestanding) &memory.slab.global_slab else null));
     }
 
-    /// Terminate current task and switch to the next ready task
+    /// Free deferred stack frames of a terminated task.
+    /// Executed on the stack of the next scheduled task or idle loop to avoid use-after-free.
+    pub fn reclaimZombie(self: *Scheduler, pmm: ?*memory.PhysicalMemoryManager, slab_alloc: ?*memory.slab.SlabAllocator) void {
+        const zid = self.zombie_task orelse return;
+        const ztask = self.getTaskById(zid) orelse {
+            self.zombie_task = null;
+            return;
+        };
+
+        const eff_pmm = pmm orelse self.pmm;
+        const eff_slab = slab_alloc orelse self.slab_alloc;
+
+        if (eff_pmm) |p| {
+            if (ztask.stack_base_phys != 0) {
+                var page_i: usize = 0;
+                while (page_i < ztask.stack_page_count) : (page_i += 1) {
+                    if (eff_slab) |s| {
+                        ztask.managed_stack_pages[page_i].deallocate(p, s);
+                    } else {
+                        p.freeFrame(ztask.managed_stack_pages[page_i].phys_addr);
+                    }
+                }
+                ztask.stack_base_phys = 0;
+                ztask.stack_page_count = 0;
+            }
+        }
+        self.zombie_task = null;
+    }
+
+    /// Terminate current task and switch to the next ready task.
+    /// Defers stack reclamation to prevent use-after-free while executing on the current task's stack.
     pub fn exit(self: *Scheduler, pmm: ?*memory.PhysicalMemoryManager, slab_alloc: ?*memory.slab.SlabAllocator) noreturn {
         const cur_id = self.current_task_id orelse {
             while (true) {}
@@ -294,21 +334,10 @@ pub const Scheduler = struct {
         cur_task.state = .terminated;
         if (self.task_count > 0) self.task_count -= 1;
 
-        // Free stack frames when PMM is available
-        if (pmm) |p| {
-            if (cur_task.stack_base_phys != 0) {
-                var page_i: usize = 0;
-                while (page_i < cur_task.stack_page_count) : (page_i += 1) {
-                    if (slab_alloc) |s| {
-                        cur_task.managed_stack_pages[page_i].deallocate(p, s);
-                    } else {
-                        p.freeFrame(cur_task.managed_stack_pages[page_i].phys_addr);
-                    }
-                }
-                cur_task.stack_base_phys = 0;
-                cur_task.stack_page_count = 0;
-            }
-        }
+        // Defer stack reclamation to prevent use-after-free: store terminating task ID in zombie_task
+        self.zombie_task = cur_id;
+        if (pmm) |p| self.pmm = p;
+        if (slab_alloc) |s| self.slab_alloc = s;
 
         // Find next ready task
         var next_task: ?*Task = null;
@@ -325,12 +354,24 @@ pub const Scheduler = struct {
             self.switch_count += 1;
             loadContext(&next.context);
         } else {
-            // No ready tasks left: return to primary task if not terminated or hang
+            // No ready tasks left: return to primary task if not terminated or hang in idle loop
             if (self.tasks[0].state != .terminated) {
                 self.tasks[0].state = .running;
                 self.current_task_id = self.tasks[0].id;
                 loadContext(&self.tasks[0].context);
             }
+
+            // Idle loop: switch away from terminating task stack before reclaiming zombie stack
+            const idle_sp = @as(usize, @intFromPtr(&self.static_stacks[0][0])) + DEFAULT_STACK_SIZE;
+            if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .freestanding) {
+                asm volatile (
+                    \\ mov sp, %[sp]
+                    :
+                    : [sp] "r" (idle_sp & ~@as(usize, 15)),
+                    : "memory"
+                );
+            }
+            self.reclaimZombie(self.pmm, self.slab_alloc);
             while (true) {
                 if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .freestanding) {
                     asm volatile ("wfe");
@@ -416,6 +457,9 @@ pub fn loadContext(next: *const TaskContext) noreturn {
 
 /// Trampoline function invoked when a new green thread first starts execution
 pub fn taskEntryTrampoline() callconv(.C) void {
+    // Reclaim deferred zombie stack now that we are executing on the newly scheduled task's stack
+    global_scheduler.reclaimZombie(global_scheduler.pmm orelse (if (builtin.os.tag == .freestanding) &memory.global_pmm else null), global_scheduler.slab_alloc orelse (if (builtin.os.tag == .freestanding) &memory.slab.global_slab else null));
+
     const cur = global_scheduler.getCurrentTask();
     if (cur) |t| {
         if (t.entry) |func| {
@@ -518,4 +562,79 @@ test "cooperative round-robin scheduling transitions" {
     try std.testing.expectEqual(TaskState.running, sched.getTaskById(0).?.state);
     try std.testing.expectEqual(TaskState.ready, sched.getTaskById(t2).?.state);
     try std.testing.expectEqual(@as(u64, 3), sched.switch_count);
+}
+
+test "deferred stack reclamation via zombie_task on exit" {
+    var sched: Scheduler = .{};
+    sched.init();
+
+    const dummyEntry = struct {
+        fn run(arg: u64) void {
+            _ = arg;
+        }
+    }.run;
+
+    const t1 = sched.spawnStatic(dummyEntry, 10, "task_1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), sched.task_count);
+
+    // Simulate task 1 running and exiting
+    sched.current_task_id = t1;
+    sched.getTaskById(t1).?.state = .running;
+    sched.zombie_task = t1;
+    sched.getTaskById(t1).?.state = .terminated;
+    sched.task_count -= 1;
+
+    try std.testing.expectEqual(@as(?TaskId, t1), sched.zombie_task);
+
+    // Reclaim zombie on next task execution
+    sched.reclaimZombie(null, null);
+    try std.testing.expectEqual(@as(?TaskId, null), sched.zombie_task);
+}
+
+test "reclaimZombie deallocates physical stack frames after context switch" {
+    const limine = @import("limine.zig");
+    const mock_ram_size: usize = 2 * 1024 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+    pmm.init(base_addr, &mock_mmap);
+
+    var sched: Scheduler = .{};
+    sched.init();
+
+    const dummyEntry = struct {
+        fn run(arg: u64) void {
+            _ = arg;
+        }
+    }.run;
+
+    const initial_free = pmm.free_frames;
+    const t1 = sched.spawn(&pmm, dummyEntry, 10, "worker") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(initial_free - STACK_PAGE_COUNT, pmm.free_frames);
+
+    // Simulate task termination: mark terminated, set zombie_task, stack NOT yet freed
+    sched.zombie_task = t1;
+    sched.getTaskById(t1).?.state = .terminated;
+
+    // Stack is still allocated while zombie_task is set
+    try std.testing.expectEqual(initial_free - STACK_PAGE_COUNT, pmm.free_frames);
+
+    // Switch contexts to another task and reclaim zombie stack
+    sched.reclaimZombie(&pmm, null);
+    try std.testing.expectEqual(@as(?TaskId, null), sched.zombie_task);
+    // Stack frames are now freed back to PMM
+    try std.testing.expectEqual(initial_free, pmm.free_frames);
 }
