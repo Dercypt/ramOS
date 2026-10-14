@@ -1,3 +1,31 @@
+//! RFC 8878 Zstandard RLE Frame Encoder and Decompressor
+//!
+//! ramOS integrates a freestanding RFC 8878 frame encoder designed for zero-allocation
+//! in-RAM kernel page compression.
+//!
+//! ### Encoding Architecture & Scope
+//! This engine implements bare-metal RFC 8878 framing restricted to Run-Length Encoded (RLE)
+//! blocks and raw uncompressed blocks. It emits standard Zstandard frames containing:
+//!   - Zstandard Magic Number (0xFD2FB528)
+//!   - Frame Header Descriptor (Single Segment, FCS field)
+//!   - RLE Blocks (Type 1) for repetitive byte sequences (>= MIN_RLE_RUN bytes)
+//!   - Raw Blocks (Type 0) as fallback for non-uniform chunks
+//!
+//! ### Incompressibility and Header Overhead
+//! Because complex entropy coding stages (Finite State Entropy / Huffman) are intentionally
+//! omitted to preserve freestanding bare-metal determinism and avoid dynamic allocation,
+//! high-entropy input pages lacking byte runs cannot achieve compression. In such cases,
+//! RFC 8878 raw block framing appends frame headers (7 bytes) and raw block headers (3 bytes),
+//! expanding a 4096-byte page to 4106 bytes.
+//!
+//! Downstream memory management subsystems (`compressAndStore` and `ManagedPage.compress`)
+//! must verify `comp_len <= memory.PAGE_SIZE`. If `comp_len > memory.PAGE_SIZE`, the page
+//! must be marked as incompressible, eviction must be skipped, and `error.IncompressiblePage`
+//! must be returned to avoid failing slab class lookups (`sizeToClassIndex()`).
+//!
+//! ### Decompression
+//! Decompression is fully RFC 8878 compliant via Zig's standard library Zstandard decoder.
+
 const std = @import("std");
 
 /// RFC 8878 Zstandard Magic Number (0xFD2FB528, little-endian: [0x28, 0xB5, 0x2F, 0xFD])
@@ -92,7 +120,10 @@ pub const ZSTD_CCtx = struct {
         self.total_uncompressed = 0;
     }
 
-    /// Compress src into dst using bare-metal RFC 8878 Zstandard framing
+    /// Compress src into dst using RFC 8878 Zstandard framing (RLE and raw blocks).
+    /// Note: This is an RLE frame encoder. If the payload has high entropy and cannot be
+    /// compressed using RLE runs (>= MIN_RLE_RUN), raw framing will be used, producing output
+    /// larger than src.len (up to src.len + 10 bytes for standard single-segment frames).
     pub fn compress(
         self: *ZSTD_CCtx,
         dst: []u8,
@@ -420,4 +451,19 @@ test "zstd compression and decompression roundtrip" {
     var empty_out: [16]u8 = undefined;
     const empty_decomp_len = try ZSTD_decompressDCtx(dctx, &empty_out, compressed_buf[0..empty_comp_len]);
     try std.testing.expectEqual(@as(usize, 0), empty_decomp_len);
+
+    // 6. High-entropy incompressible 4 KiB frame
+    var high_entropy_page: [4096]u8 = undefined;
+    for (&high_entropy_page, 0..) |*b, i| {
+        b.* = @truncate((i *% 101 +% 37) & 0xFF);
+    }
+
+    const high_entropy_comp_len = try ZSTD_compressCCtx(cctx, &compressed_buf, &high_entropy_page, 1);
+    // Frame header (7 bytes) + Raw block header (3 bytes) + Payload (4096 bytes) = 4106 bytes
+    try std.testing.expect(high_entropy_comp_len > 4096);
+    try std.testing.expectEqual(@as(usize, 4106), high_entropy_comp_len);
+
+    const high_decomp_len = try ZSTD_decompressDCtx(dctx, &decompressed_buf, compressed_buf[0..high_entropy_comp_len]);
+    try std.testing.expectEqual(@as(usize, 4096), high_decomp_len);
+    try std.testing.expectEqualSlices(u8, &high_entropy_page, &decompressed_buf);
 }
