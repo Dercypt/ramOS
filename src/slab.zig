@@ -396,12 +396,18 @@ pub const SlabAllocator = struct {
         }
     }
 
-    /// Synchronously compress an uncompressed 4 KiB frame and store the compressed payload into the slab pool
-    pub fn compressAndStore(self: *SlabAllocator, frame_data: []const u8) ?PageHandle {
-        const cctx = self.cctx orelse return null;
+    /// Synchronously compress an uncompressed 4 KiB frame and store the compressed payload into the slab pool.
+    /// If the compressed frame exceeds PAGE_SIZE (e.g. high-entropy payload lacking RLE runs),
+    /// eviction is aborted for this frame and error.IncompressiblePage is explicitly returned.
+    pub fn compressAndStore(self: *SlabAllocator, frame_data: []const u8) !PageHandle {
+        if (frame_data.len > memory.PAGE_SIZE) return error.CompressionFailed;
+        const cctx = self.cctx orelse return error.ContextNotInitialized;
         var comp_buf: [zstd.ZSTD_compressBound(memory.PAGE_SIZE)]u8 = undefined;
-        const comp_len = cctx.compress(&comp_buf, frame_data, 1) catch return null;
-        return self.allocCompressed(comp_buf[0..comp_len]);
+        const comp_len = cctx.compress(&comp_buf, frame_data, 1) catch return error.CompressionFailed;
+        if (comp_len > memory.PAGE_SIZE) {
+            return error.IncompressiblePage;
+        }
+        return self.allocCompressed(comp_buf[0..comp_len]) orelse error.OutOfMemory;
     }
 
     /// Retrieve and decompress a compressed page payload back into a 4 KiB destination frame
@@ -459,4 +465,42 @@ test "page handle validation" {
     try std.testing.expect(h.isValid());
     try std.testing.expectEqual(@as(u32, 1234), h.toU32());
     try std.testing.expect(!PageHandle.invalid.isValid());
+}
+
+test "compressAndStore rejects incompressible high entropy page" {
+    const std = @import("std");
+    const limine = @import("limine.zig");
+
+    const mock_ram_size: usize = 2 * 1024 * 1024; // 2 MiB
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    // High entropy page that cannot be RLE-compressed
+    var high_entropy_page: [memory.PAGE_SIZE]u8 = undefined;
+    for (&high_entropy_page, 0..) |*b, i| {
+        b.* = @truncate((i *% 101 +% 37) & 0xFF);
+    }
+
+    const result = slab_alloc.compressAndStore(&high_entropy_page);
+    try std.testing.expectError(error.IncompressiblePage, result);
 }

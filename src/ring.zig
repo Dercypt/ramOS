@@ -97,12 +97,12 @@ pub const ManagedPage = struct {
         const virt: [*]const u8 = pmm.physToVirt(self.phys_addr);
         const frame_slice = virt[0..memory.PAGE_SIZE];
 
-        const handle = slab_alloc.compressAndStore(frame_slice) orelse {
+        const handle = slab_alloc.compressAndStore(frame_slice) catch |err| {
             self.state = .cold;
             if (frame_idx < pmm.total_frames) {
                 pmm.frame_table[frame_idx].state = .cold;
             }
-            return error.CompressionFailed;
+            return err;
         };
 
         const comp_slice = slab_alloc.getCompressed(handle);
@@ -392,7 +392,12 @@ pub const CompressionRing = struct {
 
         // If this entry references a ManagedPage abstraction
         if (entry.managed_page) |mp| {
-            const handle = mp.compress(pmm, slab_alloc) catch return null;
+            const handle = mp.compress(pmm, slab_alloc) catch |err| {
+                if (err == error.IncompressiblePage) {
+                    // Page is incompressible; eviction is skipped for this page
+                }
+                return null;
+            };
             var res = entry;
             res.handle = handle;
             res.status = .compressed;
@@ -414,9 +419,12 @@ pub const CompressionRing = struct {
             pmm.frame_table[frame_idx].state = .compressing;
         }
 
-        const handle = slab_alloc.compressAndStore(frame_slice) orelse {
+        const handle = slab_alloc.compressAndStore(frame_slice) catch |err| {
             if (frame_idx < pmm.total_frames) {
                 pmm.frame_table[frame_idx].state = .cold;
+            }
+            if (err == error.IncompressiblePage) {
+                // Raw frame is incompressible; eviction is skipped for this frame
             }
             return null;
         };
@@ -450,11 +458,13 @@ pub const CompressionRing = struct {
         defer pmm.is_evicting = was_evicting;
 
         var evicted_count: usize = 0;
-        while (pmm.free_frames < target_free) {
-            if (self.evictOne(pmm, slab_alloc) == null) {
-                break; // No more cold pages available to evict
+        var max_attempts = self.getCount() + pmm.total_frames;
+        while (pmm.free_frames < target_free and max_attempts > 0) : (max_attempts -= 1) {
+            if (self.evictOne(pmm, slab_alloc) != null) {
+                evicted_count += 1;
+            } else if (self.isEmpty()) {
+                break; // No more queued pages to attempt
             }
-            evicted_count += 1;
         }
         return evicted_count;
     }
@@ -727,4 +737,122 @@ test "synchronous eviction triggered during allocation under memory pressure" {
     for (&cold_pages) |*cp| {
         cp.deallocate(&pmm, &slab_alloc);
     }
+}
+
+test "managed page skips eviction and returns error.IncompressiblePage for high entropy data" {
+    const mock_ram_size: usize = 2 * 1024 * 1024; // 2 MiB
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: slab.SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    const phys = pmm.allocFrame() orelse return error.TestUnexpectedResult;
+    var page = ManagedPage.initActive(phys);
+
+    // Populate with high entropy bytes
+    const virt: [*]u8 = pmm.physToVirt(phys);
+    for (virt[0..memory.PAGE_SIZE], 0..) |*b, i| {
+        b.* = @truncate((i *% 101 +% 37) & 0xFF);
+    }
+
+    _ = page.markCold(&pmm);
+    const initial_free = pmm.free_frames;
+
+    // Compression should explicitly return error.IncompressiblePage
+    const comp_result = page.compress(&pmm, &slab_alloc);
+    try std.testing.expectError(error.IncompressiblePage, comp_result);
+
+    // Eviction was skipped: page remains in physical RAM, frame was not freed
+    try std.testing.expectEqual(initial_free, pmm.free_frames);
+    try std.testing.expectEqual(phys, page.phys_addr);
+    try std.testing.expect(!page.isCompressed());
+    try std.testing.expect(page.isCold());
+
+    // Clean up
+    page.deallocate(&pmm, &slab_alloc);
+}
+
+test "watermark eviction skips incompressible page and continues with compressible pages" {
+    const mock_ram_size: usize = 4 * 1024 * 1024; // 4 MiB = 1024 frames
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: slab.SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    // Warm up slab allocator
+    const warmup = slab_alloc.allocCompressed("warmup") orelse return error.TestUnexpectedResult;
+    slab_alloc.freeCompressed(warmup);
+
+    var ring: CompressionRing = .{};
+    ring.init(&pmm, &slab_alloc);
+
+    // Page 1: high entropy incompressible page
+    const p1 = pmm.allocFrame() orelse return error.TestUnexpectedResult;
+    const v1: [*]u8 = pmm.physToVirt(p1);
+    for (v1[0..memory.PAGE_SIZE], 0..) |*b, i| {
+        b.* = @truncate((i *% 101 +% 37) & 0xFF);
+    }
+    var incomp_page = ManagedPage.initActive(p1);
+    _ = incomp_page.markCold(&pmm);
+    _ = ring.enqueueManagedPage(&incomp_page);
+
+    // Page 2: compressible uniform page
+    const p2 = pmm.allocFrame() orelse return error.TestUnexpectedResult;
+    const v2: [*]u8 = pmm.physToVirt(p2);
+    @memset(v2[0..memory.PAGE_SIZE], 'U');
+    var comp_page = ManagedPage.initActive(p2);
+    _ = comp_page.markCold(&pmm);
+    _ = ring.enqueueManagedPage(&comp_page);
+
+    try std.testing.expectEqual(@as(usize, 2), ring.getCount());
+
+    const target_free = pmm.free_frames + 1;
+    const evicted = ring.evictUntil(&pmm, &slab_alloc, target_free);
+
+    // Incompressible page was skipped, compressible page was evicted
+    try std.testing.expectEqual(@as(usize, 1), evicted);
+    try std.testing.expect(incomp_page.isCold());
+    try std.testing.expect(incomp_page.phys_addr != 0);
+    try std.testing.expect(comp_page.isCompressed());
+    try std.testing.expectEqual(@as(u64, 0), comp_page.phys_addr);
+
+    // Clean up
+    incomp_page.deallocate(&pmm, &slab_alloc);
+    comp_page.deallocate(&pmm, &slab_alloc);
 }
