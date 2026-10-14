@@ -30,6 +30,24 @@ pub fn build(b: *std.Build) void {
     const kernel_step = b.step("kernel", "Build the ramOS AArch64 kernel");
     kernel_step.dependOn(&b.addInstallArtifact(kernel, .{}).step);
 
+    const run_cmd = b.addSystemCommand(&.{
+        "qemu-system-aarch64",
+        "-M",
+        "virt",
+        "-cpu",
+        "cortex-a57",
+        "-display",
+        "none",
+        "-serial",
+        "stdio",
+        "-kernel",
+        "zig-out/bin/kernel.elf",
+    });
+    run_cmd.step.dependOn(kernel_step);
+
+    const run_step = b.step("run", "Run the kernel in QEMU");
+    run_step.dependOn(&run_cmd.step);
+
     const slab_tests = b.addTest(.{
         .root_source_file = b.path("src/slab.zig"),
         .target = b.resolveTargetQuery(.{}),
