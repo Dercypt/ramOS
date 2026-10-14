@@ -152,7 +152,7 @@ fn testZstdCompression() void {
     var zero_page: [memory.PAGE_SIZE]u8 = undefined;
     @memset(&zero_page, 0);
 
-    const zero_handle = memory.slab.global_slab.compressAndStore(&zero_page) orelse @panic("Failed to compress zeroed frame");
+    const zero_handle = memory.slab.global_slab.compressAndStore(&zero_page) catch @panic("Failed to compress zeroed frame");
     if (!zero_handle.isValid()) @panic("Invalid zeroed page handle");
 
     const zero_comp_slice = memory.slab.global_slab.getCompressed(zero_handle) orelse @panic("Failed to get compressed zero slice");
@@ -175,7 +175,7 @@ fn testZstdCompression() void {
     @memcpy(pattern_page[3000..3023], "ramOS Zstandard Phase 3");
     @memset(pattern_page[3023..4096], 'Z');
 
-    const pat_handle = memory.slab.global_slab.compressAndStore(&pattern_page) orelse @panic("Failed to compress pattern frame");
+    const pat_handle = memory.slab.global_slab.compressAndStore(&pattern_page) catch @panic("Failed to compress pattern frame");
     const pat_comp_slice = memory.slab.global_slab.getCompressed(pat_handle) orelse @panic("Failed to get pattern slice");
     if (pat_comp_slice.len >= memory.PAGE_SIZE) @panic("Pattern frame failed to achieve compression");
 
@@ -206,7 +206,7 @@ fn testZstdCompression() void {
     // 4. Test frame table integration with compressed handle
     const frame_phys = memory.global_pmm.allocFrame() orelse @panic("Failed to alloc physical frame");
     const frame_idx = frame_phys / memory.PAGE_SIZE;
-    const meta_handle = memory.slab.global_slab.compressAndStore(&zero_page) orelse @panic("Failed to compress for frame meta");
+    const meta_handle = memory.slab.global_slab.compressAndStore(&zero_page) catch @panic("Failed to compress for frame meta");
     memory.global_pmm.frame_table[frame_idx].setCompressed(meta_handle);
 
     if (!memory.global_pmm.frame_table[frame_idx].isCompressed()) @panic("FrameMeta not marked as compressed");
@@ -214,6 +214,18 @@ fn testZstdCompression() void {
 
     memory.slab.global_slab.freeCompressed(meta_handle);
     memory.global_pmm.freeFrame(frame_phys);
+
+    // 5. Test rejection of high-entropy incompressible page
+    var high_entropy_page: [memory.PAGE_SIZE]u8 = undefined;
+    for (&high_entropy_page, 0..) |*b, i| {
+        b.* = @truncate((i *% 101 +% 37) & 0xFF);
+    }
+    const incomp_res = memory.slab.global_slab.compressAndStore(&high_entropy_page);
+    if (incomp_res) |_| {
+        @panic("Incompressible page should not have compressed successfully");
+    } else |err| {
+        if (err != error.IncompressiblePage) @panic("Expected error.IncompressiblePage for high-entropy frame");
+    }
 }
 
 fn testSlabAllocator() void {
@@ -347,6 +359,28 @@ fn testCompressionRing() void {
     for (&cold_batch) |*cp| {
         cp.deallocate(&memory.global_pmm, &memory.slab.global_slab);
     }
+
+    // 4. Test Incompressible Page Rejection and Frame Preservation
+    const phys_incomp = memory.global_pmm.allocFrame() orelse @panic("Failed to allocate frame for incompressible test");
+    const v_incomp: [*]u8 = memory.global_pmm.physToVirt(phys_incomp);
+    for (v_incomp[0..memory.PAGE_SIZE], 0..) |*b, i| {
+        b.* = @truncate((i *% 101 +% 37) & 0xFF);
+    }
+    var incomp_page = ring.ManagedPage.initActive(phys_incomp);
+    _ = incomp_page.markCold(&memory.global_pmm);
+
+    const comp_attempt = incomp_page.compress(&memory.global_pmm, &memory.slab.global_slab);
+    if (comp_attempt) |_| {
+        @panic("High-entropy ManagedPage should not compress");
+    } else |err| {
+        if (err != error.IncompressiblePage) @panic("Expected error.IncompressiblePage for ManagedPage");
+    }
+
+    // Ensure physical frame is preserved and eviction was skipped
+    if (!incomp_page.isCold()) @panic("Incompressible page state must remain cold");
+    if (incomp_page.phys_addr != phys_incomp) @panic("Incompressible page physical address must be retained");
+
+    incomp_page.deallocate(&memory.global_pmm, &memory.slab.global_slab);
 }
 
 // Global state tracking task switcher self-test execution
