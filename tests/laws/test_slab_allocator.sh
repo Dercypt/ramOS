@@ -35,6 +35,11 @@ if ! grep -q "allocCompressed" src/slab.zig; then
     exit 1
 fi
 
+if ! grep -q "preallocateBlock" src/slab.zig; then
+    echo "ERROR: preallocateBlock must be present to ensure pre-allocated slab blocks prevent eviction deadlock."
+    exit 1
+fi
+
 if command -v zig >/dev/null 2>&1; then
     zig test src/slab.zig
 fi
