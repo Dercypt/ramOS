@@ -273,7 +273,13 @@ pub const Scheduler = struct {
         self.current_task_id = next.id;
         self.switch_count += 1;
 
-        switchContext(&cur_task.context, &next.context);
+        if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .freestanding) {
+            const switch_fn: *const fn (*TaskContext, *const TaskContext) callconv(.C) void = @ptrCast(&switchContext);
+            switch_fn(&cur_task.context, &next.context);
+        } else {
+            // Hosted test simulation
+            cur_task.context.x19 = next.context.x19;
+        }
     }
 
     /// Terminate current task and switch to the next ready task
@@ -338,48 +344,47 @@ pub var global_scheduler: Scheduler = .{};
 
 /// Switch context between current and next tasks.
 /// On AArch64 bare-metal, performs register save/restore via inline assembly.
+/// Uses callconv(.Naked) to prevent compiler prologue/epilogue from corrupting stack frames.
 /// On hosted/test targets, updates context structures.
-pub fn switchContext(current: *TaskContext, next: *const TaskContext) void {
+pub fn switchContext(current: *TaskContext, next: *const TaskContext) callconv(.Naked) void {
+    _ = current;
+    _ = next;
     if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .freestanding) {
         // AArch64 cooperative context switch: save x19-x30, SP, and callee-saved SIMD d8-d15
+        // x0 = current context, x1 = next context via standard calling convention
         asm volatile (
             \\ // Save callee-saved registers into current context
-            \\ stp x19, x20, [%[curr], #0]
-            \\ stp x21, x22, [%[curr], #16]
-            \\ stp x23, x24, [%[curr], #32]
-            \\ stp x25, x26, [%[curr], #48]
-            \\ stp x27, x28, [%[curr], #64]
-            \\ stp x29, x30, [%[curr], #80]
+            \\ stp x19, x20, [x0, #0]
+            \\ stp x21, x22, [x0, #16]
+            \\ stp x23, x24, [x0, #32]
+            \\ stp x25, x26, [x0, #48]
+            \\ stp x27, x28, [x0, #64]
+            \\ stp x29, x30, [x0, #80]
             \\ mov x9, sp
-            \\ str x9, [%[curr], #96]
-            \\ stp d8, d9, [%[curr], #112]
-            \\ stp d10, d11, [%[curr], #128]
-            \\ stp d12, d13, [%[curr], #144]
-            \\ stp d14, d15, [%[curr], #160]
+            \\ str x9, [x0, #96]
+            \\ stp d8, d9, [x0, #112]
+            \\ stp d10, d11, [x0, #128]
+            \\ stp d12, d13, [x0, #144]
+            \\ stp d14, d15, [x0, #160]
             \\
             \\ // Restore registers from next context
-            \\ ldr x9, [%[nxt], #96]
+            \\ ldr x9, [x1, #96]
             \\ mov sp, x9
-            \\ ldp x19, x20, [%[nxt], #0]
-            \\ ldp x21, x22, [%[nxt], #16]
-            \\ ldp x23, x24, [%[nxt], #32]
-            \\ ldp x25, x26, [%[nxt], #48]
-            \\ ldp x27, x28, [%[nxt], #64]
-            \\ ldp x29, x30, [%[nxt], #80]
-            \\ ldp d8, d9, [%[nxt], #112]
-            \\ ldp d10, d11, [%[nxt], #128]
-            \\ ldp d12, d13, [%[nxt], #144]
-            \\ ldp d14, d15, [%[nxt], #160]
-            \\ ldr x0, [%[nxt], #104] // Pass task arg into x0
+            \\ ldp x19, x20, [x1, #0]
+            \\ ldp x21, x22, [x1, #16]
+            \\ ldp x23, x24, [x1, #32]
+            \\ ldp x25, x26, [x1, #48]
+            \\ ldp x27, x28, [x1, #64]
+            \\ ldp x29, x30, [x1, #80]
+            \\ ldp d8, d9, [x1, #112]
+            \\ ldp d10, d11, [x1, #128]
+            \\ ldp d12, d13, [x1, #144]
+            \\ ldp d14, d15, [x1, #160]
+            \\ ldr x0, [x1, #104] // Pass task arg into x0
             \\ ret
-            :
-            : [curr] "r" (current),
-              [nxt] "r" (next),
-            : "x9", "memory"
         );
     } else {
-        // Hosted test simulation
-        current.x19 = next.x19;
+        asm volatile ("ret");
     }
 }
 
