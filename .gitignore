@@ -1,3 +1,6 @@
 .zig-cache/
 zig-out/
 *.o
+*.iso
+QEMU_EFI.fd
+.iso_staging/

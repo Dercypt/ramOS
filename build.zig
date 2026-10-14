@@ -30,6 +30,15 @@ pub fn build(b: *std.Build) void {
     const kernel_step = b.step("kernel", "Build the ramOS AArch64 kernel");
     kernel_step.dependOn(&b.addInstallArtifact(kernel, .{}).step);
 
+    const iso_cmd = b.addSystemCommand(&.{
+        "/bin/bash",
+        "scripts/build_iso.sh",
+    });
+    iso_cmd.step.dependOn(kernel_step);
+
+    const iso_step = b.step("iso", "Assemble bootable ISO image with Limine UEFI and kernel");
+    iso_step.dependOn(&iso_cmd.step);
+
     const run_cmd = b.addSystemCommand(&.{
         "qemu-system-aarch64",
         "-M",
@@ -40,10 +49,12 @@ pub fn build(b: *std.Build) void {
         "none",
         "-serial",
         "stdio",
-        "-kernel",
-        "zig-out/bin/kernel.elf",
+        "-bios",
+        "QEMU_EFI.fd",
+        "-cdrom",
+        "image.iso",
     });
-    run_cmd.step.dependOn(kernel_step);
+    run_cmd.step.dependOn(iso_step);
 
     const run_step = b.step("run", "Run the kernel in QEMU");
     run_step.dependOn(&run_cmd.step);
