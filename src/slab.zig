@@ -102,6 +102,7 @@ pub const SlabCache = struct {
     free_list: ?*SlabBlock = null,
     total_slabs: usize = 0,
     active_allocations: usize = 0,
+    allocator: ?*SlabAllocator = null,
 
     pub fn init(self: *SlabCache, slot_size: usize) void {
         self.slot_size = slot_size;
@@ -110,6 +111,7 @@ pub const SlabCache = struct {
         self.free_list = null;
         self.total_slabs = 0;
         self.active_allocations = 0;
+        self.allocator = null;
     }
 
     fn pushList(head: *?*SlabBlock, block: *SlabBlock) void {
@@ -144,6 +146,12 @@ pub const SlabCache = struct {
         return true;
     }
 
+    pub fn attachBlock(self: *SlabCache, block: *SlabBlock, phys_addr: u64) void {
+        block.init(phys_addr, self, @intCast(self.slot_size));
+        self.total_slabs += 1;
+        pushList(&self.free_list, block);
+    }
+
     pub fn alloc(self: *SlabCache, pmm: *memory.PhysicalMemoryManager) ?[*]u8 {
         // 1. Partial slabs with available slots
         if (self.partial_list) |block| {
@@ -170,7 +178,19 @@ pub const SlabCache = struct {
         }
 
         // 3. Allocate a new 64 KiB slab block from PMM (16 contiguous frames)
-        if (!self.preallocateBlock(pmm)) return null;
+        if (!self.preallocateBlock(pmm)) {
+            // Under memory pressure when 16 contiguous frames are unavailable from PMM,
+            // pull from the pre-allocated reserve pool to prevent eviction starvation.
+            if (self.allocator) |allocator| {
+                if (allocator.popReserveBlock()) |res_block| {
+                    self.attachBlock(res_block, res_block.phys_addr);
+                } else {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        }
 
         if (self.free_list) |block| {
             removeList(&self.free_list, block);
@@ -331,6 +351,9 @@ pub const ScratchArena = struct {
     }
 };
 
+pub const MAX_RESERVE_BLOCKS: usize = 64;
+pub const EMERGENCY_CLASS_IDX: u8 = 0xFF;
+
 /// Global In-RAM Slab Allocator managing fixed-size caches for variable-length compressed chunks
 pub const SlabAllocator = struct {
     pmm: *memory.PhysicalMemoryManager = undefined,
@@ -340,17 +363,57 @@ pub const SlabAllocator = struct {
     cctx: ?*zstd.ZSTD_CCtx = null,
     dctx: ?*zstd.ZSTD_DCtx = null,
     initialized: bool = false,
+    reserve_blocks: [MAX_RESERVE_BLOCKS]?*SlabBlock = [_]?*SlabBlock{null} ** MAX_RESERVE_BLOCKS,
+    reserve_count: usize = 0,
+
+    pub fn popReserveBlock(self: *SlabAllocator) ?*SlabBlock {
+        if (self.reserve_count == 0) return null;
+        self.reserve_count -= 1;
+        const block = self.reserve_blocks[self.reserve_count];
+        self.reserve_blocks[self.reserve_count] = null;
+        return block;
+    }
+
+    pub fn reserveBlocksCount(self: *const SlabAllocator) usize {
+        return self.reserve_count;
+    }
 
     pub fn init(self: *SlabAllocator, pmm: *memory.PhysicalMemoryManager) void {
         self.pmm = pmm;
+        self.reserve_count = 0;
+        for (&self.reserve_blocks) |*b| {
+            b.* = null;
+        }
+
         for (SIZE_CLASSES, 0..) |size, i| {
             self.caches[i].init(size);
+            self.caches[i].allocator = self;
             // Pre-allocate at least one SlabBlock per size class so that eviction into
             // existing caches is guaranteed to have spare slots without demanding 16
             // contiguous free frames during an active low-memory state.
             if (!self.caches[i].preallocateBlock(pmm)) {
                 @panic("Failed to pre-allocate slab block for size class");
             }
+        }
+
+        // Dynamically allocate a pool of reserve slab blocks at boot sized to match
+        // the maximum expected eviction volume (up to watermark_high or ring capacity).
+        // Each 64 KiB block holds 15 slots for the 4096-byte class, and more for smaller classes.
+        const max_eviction = if (pmm.watermark_high > 0) pmm.watermark_high else 1024;
+        const reserve_needed = @min(MAX_RESERVE_BLOCKS, (max_eviction + 14) / 15);
+        // Cap reserve allocation to at most 25% of free physical frames
+        const max_reserve_frames = pmm.free_frames / 4;
+        const max_allowed_reserves = max_reserve_frames / SLAB_FRAMES_PER_BLOCK;
+        const target_reserves = @min(reserve_needed, max_allowed_reserves);
+
+        var r: usize = 0;
+        while (r < target_reserves) : (r += 1) {
+            const phys = pmm.allocContiguousFrames(SLAB_FRAMES_PER_BLOCK, SLAB_FRAMES_PER_BLOCK) orelse break;
+            const virt: [*]u8 = pmm.physToVirt(phys);
+            const block: *SlabBlock = @ptrCast(@alignCast(virt));
+            block.phys_addr = phys;
+            self.reserve_blocks[self.reserve_count] = block;
+            self.reserve_count += 1;
         }
 
         // Initialize 16,384 handles for compressed page pool
@@ -391,13 +454,28 @@ pub const SlabAllocator = struct {
         }
     }
 
-    /// Store a compressed page payload in the slab pool and return a PageHandle
+    /// Store a compressed page payload in the slab pool and return a PageHandle.
+    /// Falls back to allocating single 4 KiB frames for emergency slab storage
+    /// when under memory pressure and 16 contiguous frames are unavailable.
     pub fn allocCompressed(self: *SlabAllocator, data: []const u8) ?PageHandle {
         if (data.len == 0 or data.len > memory.PAGE_SIZE) return null;
         const class_idx = sizeToClassIndex(data.len) orelse return null;
-        const slot = self.caches[class_idx].alloc(self.pmm) orelse return null;
-        @memcpy(slot[0..data.len], data);
-        return self.handle_mgr.allocHandle(slot, @intCast(data.len), @intCast(class_idx));
+
+        // 1. Try standard / reserve slab cache allocation
+        if (self.caches[class_idx].alloc(self.pmm)) |slot| {
+            @memcpy(slot[0..data.len], data);
+            return self.handle_mgr.allocHandle(slot, @intCast(data.len), @intCast(class_idx));
+        }
+
+        // 2. Emergency fallback: allocate a single 4 KiB frame for emergency slab storage
+        // when contiguous 64 KiB (16-frame) slab blocks cannot be allocated under memory pressure.
+        if (self.pmm.allocFrame()) |single_phys| {
+            const emergency_ptr: [*]u8 = self.pmm.physToVirt(single_phys);
+            @memcpy(emergency_ptr[0..data.len], data);
+            return self.handle_mgr.allocHandle(emergency_ptr, @intCast(data.len), EMERGENCY_CLASS_IDX);
+        }
+
+        return null;
     }
 
     /// Retrieve compressed page slice given a PageHandle
@@ -408,7 +486,13 @@ pub const SlabAllocator = struct {
     /// Free a compressed page from the slab pool
     pub fn freeCompressed(self: *SlabAllocator, handle: PageHandle) void {
         if (self.handle_mgr.freeHandle(handle)) |entry| {
-            self.caches[entry.class_idx].free(self.pmm, entry.ptr);
+            if (entry.class_idx == EMERGENCY_CLASS_IDX) {
+                // Free emergency single 4 KiB frame directly back to PMM
+                const phys = self.pmm.virtToPhys(@intFromPtr(entry.ptr));
+                self.pmm.freeFrame(phys);
+            } else {
+                self.caches[entry.class_idx].free(self.pmm, entry.ptr);
+            }
         }
     }
 
@@ -582,4 +666,138 @@ test "pre-allocated slab blocks prevent deadlock when free frames drop below 16"
 
     slab_alloc.freeCompressed(handle);
     slab_alloc.freeCompressed(comp_handle);
+}
+
+test "prevent slab allocation starvation during low-memory eviction with reserve blocks" {
+    const std = @import("std");
+    const limine = @import("limine.zig");
+
+    // 4 MiB RAM = 1024 frames
+    const mock_ram_size: usize = 4 * 1024 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    // Initial 4096-byte slab block has 15 slots.
+    // Fill all 15 slots of the 4096-byte class with 3500-byte payloads.
+    var handles: [16]PageHandle = undefined;
+    var payload: [3500]u8 = undefined;
+
+    var i: usize = 0;
+    while (i < 15) : (i += 1) {
+        @memset(&payload, @truncate(i + 1));
+        handles[i] = slab_alloc.allocCompressed(&payload) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(handles[i].isValid());
+    }
+
+    // Now exhaust physical memory so contiguous 16 frames are unavailable
+    while (pmm.free_frames > 5) {
+        _ = pmm.allocFrame() orelse break;
+    }
+
+    // Ensure 16 contiguous frames cannot be allocated
+    try std.testing.expectEqual(@as(?u64, null), pmm.allocContiguousFrames(SLAB_FRAMES_PER_BLOCK, SLAB_FRAMES_PER_BLOCK));
+
+    // The 16th allocation would fail in the old code because 15 slots are full
+    // and allocating 16 contiguous frames for a new block fails under memory pressure.
+    // With reserve blocks / emergency fallback, allocation succeeds without deadlocking.
+    @memset(&payload, 0xEE);
+    handles[15] = slab_alloc.allocCompressed(&payload) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(handles[15].isValid());
+
+    // Verify bit-for-bit retrieval of the 16th allocation
+    const retrieved = slab_alloc.getCompressed(handles[15]) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, &payload, retrieved);
+
+    // Clean up
+    var j: usize = 0;
+    while (j <= 15) : (j += 1) {
+        slab_alloc.freeCompressed(handles[j]);
+    }
+}
+
+test "emergency single frame fallback when reserve pool and contiguous memory are exhausted" {
+    const std = @import("std");
+    const limine = @import("limine.zig");
+
+    const mock_ram_size: usize = 2 * 1024 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    // Deplete any reserve blocks in slab_alloc
+    while (slab_alloc.popReserveBlock()) |_| {}
+
+    // Fill all 15 slots of the 4096 size class with 3500-byte payloads
+    var handles: [16]PageHandle = undefined;
+    var payload: [3500]u8 = undefined;
+    @memset(&payload, 0x42);
+
+    var i: usize = 0;
+    while (i < 15) : (i += 1) {
+        handles[i] = slab_alloc.allocCompressed(&payload) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(handles[i].isValid());
+    }
+
+    // Now drain free frames so fewer than 16 remain
+    while (pmm.free_frames > 3) {
+        _ = pmm.allocFrame() orelse break;
+    }
+
+    // Contiguous 16 frames unavailable:
+    try std.testing.expectEqual(@as(?u64, null), pmm.allocContiguousFrames(SLAB_FRAMES_PER_BLOCK, SLAB_FRAMES_PER_BLOCK));
+
+    // Storing a 16th page must fall back to emergency single frame
+    handles[15] = slab_alloc.allocCompressed(&payload) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(handles[15].isValid());
+
+    // Verify it is tracked as emergency
+    const entry = slab_alloc.handle_mgr.entries[handles[15].id];
+    try std.testing.expectEqual(EMERGENCY_CLASS_IDX, entry.class_idx);
+
+    // Verify retrieved slice and clean up
+    const retrieved = slab_alloc.getCompressed(handles[15]) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, &payload, retrieved);
+
+    for (handles) |h| {
+        slab_alloc.freeCompressed(h);
+    }
 }
