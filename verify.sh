@@ -24,4 +24,19 @@ for test_script in tests/laws/*.sh; do
     fi
 done
 
+echo "[+] 4. Verifying QEMU target..."
+if command -v qemu-system-aarch64 >/dev/null 2>&1; then
+    echo "    qemu-system-aarch64 detected."
+    if [ "${RUN_QEMU:-0}" = "1" ] || [ "$1" = "--qemu" ]; then
+        echo "    Launching kernel in QEMU via 'zig build run'..."
+        zig build run
+    else
+        echo "    Run './verify.sh --qemu' or 'zig build run' to launch QEMU test."
+    fi
+else
+    echo "[!] qemu-system-aarch64 not detected in PATH."
+    echo "    To install on macOS: brew install qemu"
+    echo "    Skipping QEMU launch for now."
+fi
+
 echo "[+] All checks passed successfully!"
