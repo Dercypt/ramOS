@@ -134,6 +134,16 @@ pub const SlabCache = struct {
         block.prev = null;
     }
 
+    pub fn preallocateBlock(self: *SlabCache, pmm: *memory.PhysicalMemoryManager) bool {
+        const phys = pmm.allocContiguousFrames(SLAB_FRAMES_PER_BLOCK, SLAB_FRAMES_PER_BLOCK) orelse return false;
+        const virt: [*]u8 = pmm.physToVirt(phys);
+        const block: *SlabBlock = @ptrCast(@alignCast(virt));
+        block.init(phys, self, @intCast(self.slot_size));
+        self.total_slabs += 1;
+        pushList(&self.free_list, block);
+        return true;
+    }
+
     pub fn alloc(self: *SlabCache, pmm: *memory.PhysicalMemoryManager) ?[*]u8 {
         // 1. Partial slabs with available slots
         if (self.partial_list) |block| {
@@ -160,20 +170,20 @@ pub const SlabCache = struct {
         }
 
         // 3. Allocate a new 64 KiB slab block from PMM (16 contiguous frames)
-        const phys = pmm.allocContiguousFrames(SLAB_FRAMES_PER_BLOCK, SLAB_FRAMES_PER_BLOCK) orelse return null;
-        const virt: [*]u8 = pmm.physToVirt(phys);
-        const block: *SlabBlock = @ptrCast(@alignCast(virt));
-        block.init(phys, self, @intCast(self.slot_size));
-        self.total_slabs += 1;
+        if (!self.preallocateBlock(pmm)) return null;
 
-        pushList(&self.partial_list, block);
-        const slot = block.allocSlot() orelse return null;
-        self.active_allocations += 1;
-        if (block.free_slots == 0) {
-            removeList(&self.partial_list, block);
-            pushList(&self.full_list, block);
+        if (self.free_list) |block| {
+            removeList(&self.free_list, block);
+            pushList(&self.partial_list, block);
+            const slot = block.allocSlot() orelse return null;
+            self.active_allocations += 1;
+            if (block.free_slots == 0) {
+                removeList(&self.partial_list, block);
+                pushList(&self.full_list, block);
+            }
+            return slot;
         }
-        return slot;
+        return null;
     }
 
     pub fn free(self: *SlabCache, pmm: *memory.PhysicalMemoryManager, ptr: [*]u8) void {
@@ -335,6 +345,12 @@ pub const SlabAllocator = struct {
         self.pmm = pmm;
         for (SIZE_CLASSES, 0..) |size, i| {
             self.caches[i].init(size);
+            // Pre-allocate at least one SlabBlock per size class so that eviction into
+            // existing caches is guaranteed to have spare slots without demanding 16
+            // contiguous free frames during an active low-memory state.
+            if (!self.caches[i].preallocateBlock(pmm)) {
+                @panic("Failed to pre-allocate slab block for size class");
+            }
         }
 
         // Initialize 16,384 handles for compressed page pool
@@ -503,4 +519,67 @@ test "compressAndStore rejects incompressible high entropy page" {
 
     const result = slab_alloc.compressAndStore(&high_entropy_page);
     try std.testing.expectError(error.IncompressiblePage, result);
+}
+
+test "pre-allocated slab blocks prevent deadlock when free frames drop below 16" {
+    const std = @import("std");
+    const limine = @import("limine.zig");
+
+    const mock_ram_size: usize = 2 * 1024 * 1024; // 2 MiB
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    // Verify all size classes have at least one pre-allocated slab block
+    try std.testing.expectEqual(NUM_SIZE_CLASSES, slab_alloc.totalSlabBlocks());
+
+    // Exhaust physical frames until free frames drop below 16
+    while (pmm.free_frames > 4) {
+        _ = pmm.allocFrame() orelse break;
+    }
+    try std.testing.expect(pmm.free_frames < 16);
+
+    // Allocating 16 contiguous frames fails because free_frames < 16
+    try std.testing.expectEqual(@as(?u64, null), pmm.allocContiguousFrames(SLAB_FRAMES_PER_BLOCK, SLAB_FRAMES_PER_BLOCK));
+
+    // Storing compressed data into existing pre-allocated slabs succeeds despite low physical memory
+    const test_payload = "Pre-allocated slab block saves the day under low physical memory!";
+    const handle = slab_alloc.allocCompressed(test_payload) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(handle.isValid());
+
+    const retrieved = slab_alloc.getCompressed(handle) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, test_payload, retrieved);
+
+    // Test compressing a 4 KiB frame into the pre-allocated slab when free frames < 16
+    var page_data: [memory.PAGE_SIZE]u8 = undefined;
+    @memset(page_data[0..memory.PAGE_SIZE], 'A');
+    const comp_handle = try slab_alloc.compressAndStore(&page_data);
+    try std.testing.expect(comp_handle.isValid());
+
+    var decomp_dest: [memory.PAGE_SIZE]u8 = undefined;
+    const decomp_len = try slab_alloc.decompressToFrame(comp_handle, &decomp_dest);
+    try std.testing.expectEqual(memory.PAGE_SIZE, decomp_len);
+    try std.testing.expectEqualSlices(u8, &page_data, &decomp_dest);
+
+    slab_alloc.freeCompressed(handle);
+    slab_alloc.freeCompressed(comp_handle);
 }
