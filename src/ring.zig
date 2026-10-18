@@ -86,7 +86,7 @@ pub const ManagedPage = struct {
         if (self.state != .cold and self.state != .active) return error.InvalidPageState;
         self.state = .compressing;
         const frame_idx = self.phys_addr / memory.PAGE_SIZE;
-        if (frame_idx < pmm.total_frames) {
+        if (frame_idx < pmm.max_frames) {
             pmm.frame_table[frame_idx].state = .compressing;
         }
 
@@ -99,7 +99,7 @@ pub const ManagedPage = struct {
 
         const handle = slab_alloc.compressAndStore(frame_slice) catch |err| {
             self.state = .cold;
-            if (frame_idx < pmm.total_frames) {
+            if (frame_idx < pmm.max_frames) {
                 pmm.frame_table[frame_idx].state = .cold;
             }
             return err;
@@ -130,7 +130,7 @@ pub const ManagedPage = struct {
         if (self.state == .active or self.state == .cold) {
             self.state = .active;
             const frame_idx = self.phys_addr / memory.PAGE_SIZE;
-            if (frame_idx < pmm.total_frames) {
+            if (frame_idx < pmm.max_frames) {
                 pmm.frame_table[frame_idx].state = .active;
             }
             self.access_count += 1;
@@ -171,7 +171,7 @@ pub const ManagedPage = struct {
             self.access_count += 1;
 
             const frame_idx = new_phys / memory.PAGE_SIZE;
-            if (frame_idx < pmm.total_frames) {
+            if (frame_idx < pmm.max_frames) {
                 pmm.frame_table[frame_idx].state = .active;
             }
 

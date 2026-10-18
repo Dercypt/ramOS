@@ -1,3 +1,4 @@
+const std = @import("std");
 const limine = @import("limine.zig");
 pub const slab = @import("slab.zig");
 
@@ -10,12 +11,19 @@ pub const PageState = enum(u8) {
     compressing = 3,
     compressed = 4,
     decompressing = 5,
+    reserved = 6,
 };
 
 pub const FrameMeta = struct {
     state: PageState = .free,
     ref_count: u32 = 0,
     compressed_handle: u32 = 0, // Points into the Zstd slab pool if compressed
+
+    pub fn setReserved(self: *FrameMeta) void {
+        self.state = .reserved;
+        self.ref_count = 0;
+        self.compressed_handle = 0;
+    }
 
     pub fn setCompressed(self: *FrameMeta, handle: slab.PageHandle) void {
         self.state = .compressed;
@@ -56,6 +64,7 @@ pub const FrameMeta = struct {
 pub const PhysicalMemoryManager = struct {
     hhdm_offset: u64 = 0,
     total_frames: usize = 0,
+    max_frames: usize = 0,
     free_frames: usize = 0,
     watermark_low: usize = 0,
     watermark_high: usize = 0,
@@ -85,8 +94,9 @@ pub const PhysicalMemoryManager = struct {
     ) void {
         self.hhdm_offset = hhdm_offset;
 
-        // 1. Determine highest usable physical address
+        // 1. Determine highest usable physical address and total usable frames
         var highest_addr: u64 = 0;
+        var usable_frames: usize = 0;
         var i: usize = 0;
         while (i < mmap.entry_count) : (i += 1) {
             const entry = mmap.entries[i];
@@ -95,23 +105,25 @@ pub const PhysicalMemoryManager = struct {
                 if (top > highest_addr) {
                     highest_addr = top;
                 }
+                usable_frames += @intCast(entry.length / PAGE_SIZE);
             }
         }
 
         self.max_phys_addr = highest_addr;
-        self.total_frames = @intCast(highest_addr / PAGE_SIZE);
+        self.max_frames = @intCast(highest_addr / PAGE_SIZE);
+        self.total_frames = usable_frames;
         self.free_frames = 0;
 
-        // Set compression watermarks (10% low watermark, 20% high watermark)
+        // Set compression watermarks (10% low watermark, 20% high watermark) based strictly on usable frames
         self.watermark_low = self.total_frames / 10;
         self.watermark_high = self.total_frames / 5;
 
-        // Calculate size needed for allocation bitmap (1 bit per 4 KiB frame)
-        self.bitmap_size_bytes = (self.total_frames + 7) / 8;
+        // Calculate size needed for allocation bitmap (1 bit per 4 KiB frame up to max_frames)
+        self.bitmap_size_bytes = (self.max_frames + 7) / 8;
         const bitmap_frames_needed = (self.bitmap_size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
 
         // Find the first usable entry with enough space to place our bitmap and frame table
-        const frame_table_size_bytes = self.total_frames * @sizeOf(FrameMeta);
+        const frame_table_size_bytes = self.max_frames * @sizeOf(FrameMeta);
         const meta_frames_needed = (frame_table_size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
         const total_reserved_frames = bitmap_frames_needed + meta_frames_needed;
 
@@ -134,18 +146,18 @@ pub const PhysicalMemoryManager = struct {
 
         // Initialize bitmap in the HHDM address space
         self.bitmap = self.physToVirt(reserved_phys);
-        // Initially mark all frames as allocated (1 = busy/unavailable)
+        // Initially mark all frames as allocated/busy (1 = busy/unavailable)
         @memset(self.bitmap[0..self.bitmap_size_bytes], 0xFF);
 
         // Frame table is placed immediately after the bitmap
         const frame_table_phys = reserved_phys + (bitmap_frames_needed * PAGE_SIZE);
         self.frame_table = @ptrCast(@alignCast(self.physToVirt(frame_table_phys)));
 
-        // Clear frame table
+        // Initialize ALL frame table slots to reserved state before unmasking usable frames
         var f: usize = 0;
-        while (f < self.total_frames) : (f += 1) {
+        while (f < self.max_frames) : (f += 1) {
             self.frame_table[f] = .{
-                .state = .free,
+                .state = .reserved,
                 .ref_count = 0,
                 .compressed_handle = 0,
             };
@@ -161,6 +173,7 @@ pub const PhysicalMemoryManager = struct {
                 while (addr + PAGE_SIZE <= end) : (addr += PAGE_SIZE) {
                     const frame_idx = addr / PAGE_SIZE;
                     self.setBit(frame_idx, false);
+                    self.frame_table[frame_idx].state = .free;
                     self.free_frames += 1;
                 }
             }
@@ -209,7 +222,7 @@ pub const PhysicalMemoryManager = struct {
     }
 
     pub fn markFrameCold(self: *PhysicalMemoryManager, frame_idx: usize) bool {
-        if (frame_idx >= self.total_frames) return false;
+        if (frame_idx >= self.max_frames) return false;
         if (self.frame_table[frame_idx].state == .active) {
             self.frame_table[frame_idx].state = .cold;
             return true;
@@ -222,7 +235,7 @@ pub const PhysicalMemoryManager = struct {
     }
 
     pub fn isCold(self: *const PhysicalMemoryManager, frame_idx: usize) bool {
-        if (frame_idx >= self.total_frames) return false;
+        if (frame_idx >= self.max_frames) return false;
         return self.frame_table[frame_idx].state == .cold;
     }
 
@@ -240,7 +253,7 @@ pub const PhysicalMemoryManager = struct {
 
         const align_val = if (alignment == 0) 1 else alignment;
         var frame_idx: usize = 0;
-        while (frame_idx + count <= self.total_frames) {
+        while (frame_idx + count <= self.max_frames) {
             const rem = frame_idx % align_val;
             if (rem != 0) {
                 frame_idx += align_val - rem;
@@ -290,7 +303,7 @@ pub const PhysicalMemoryManager = struct {
         var i: usize = 0;
         while (i < count) : (i += 1) {
             const frame_idx = start_idx + i;
-            if (frame_idx >= self.total_frames) break;
+            if (frame_idx >= self.max_frames) break;
 
             if (self.isBitSet(frame_idx)) {
                 self.setBit(frame_idx, false);
@@ -313,3 +326,60 @@ pub const PhysicalMemoryManager = struct {
 };
 
 pub var global_pmm: PhysicalMemoryManager = .{};
+
+test "discontiguous physical RAM initializes total_frames and watermarks accurately and reserves holes" {
+    // Simulate 384 KiB RAM buffer (96 frames)
+    const mock_ram_size: usize = 384 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: PhysicalMemoryManager = .{};
+
+    // Simulate memory map with a hole:
+    // Frames 0..31 (128 KiB) unmapped/hole (e.g. MMIO)
+    // Frames 32..95 (256 KiB = 64 usable frames) usable DRAM
+    var hole_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    hole_entry.base = 0;
+    hole_entry.length = 128 * 1024;
+    hole_entry.type = .reserved;
+
+    var usable_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    usable_entry.base = 128 * 1024; // frame 32
+    usable_entry.length = 256 * 1024; // 64 usable frames
+    usable_entry.type = .usable;
+
+    var entries = [_]*limine.MemoryMapEntry{ &hole_entry, &usable_entry };
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 2,
+        .entries = &entries,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    // Verify max_frames covers address space up to highest_addr (96 frames)
+    try std.testing.expectEqual(@as(usize, 96), pmm.max_frames);
+    // Verify total_frames strictly equals the sum of usable entries (64 frames)
+    try std.testing.expectEqual(@as(usize, 64), pmm.total_frames);
+
+    // Verify watermarks are computed from usable frames (64), not max_frames (96)
+    try std.testing.expectEqual(@as(usize, 64 / 10), pmm.watermark_low);
+    try std.testing.expectEqual(@as(usize, 64 / 5), pmm.watermark_high);
+
+    // Verify unmapped hole frames (0..31) are marked .reserved in frame_table
+    var f: usize = 0;
+    while (f < 32) : (f += 1) {
+        try std.testing.expectEqual(PageState.reserved, pmm.frame_table[f].state);
+    }
+
+    // Verify allocation returns a frame from usable range (>= 128 KiB)
+    const phys = pmm.allocFrame() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(phys >= 128 * 1024);
+    try std.testing.expect(phys < 384 * 1024);
+    try std.testing.expectEqual(PageState.active, pmm.frame_table[phys / PAGE_SIZE].state);
+
+    // Free the frame and verify transition to .free
+    pmm.freeFrame(phys);
+    try std.testing.expectEqual(PageState.free, pmm.frame_table[phys / PAGE_SIZE].state);
+}
