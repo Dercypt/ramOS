@@ -363,6 +363,7 @@ pub const CompressionRing = struct {
 
     /// Evict a single cold page: compresses via Zstd into the slab pool and frees
     /// the physical frame back to physical memory manager.
+    /// Compression eviction is strictly restricted to ManagedPage instances.
     pub fn evictOne(
         self: *CompressionRing,
         pmm: *memory.PhysicalMemoryManager,
@@ -372,32 +373,17 @@ pub const CompressionRing = struct {
         pmm.is_evicting = true;
         defer pmm.is_evicting = was_evicting;
 
-        // 1. Pop from circular ring buffer
-        var opt_entry = self.dequeue();
+        // Process entries from circular ring buffer, restricted exclusively to ManagedPage instances
+        while (self.dequeue()) |entry| {
+            const mp = entry.managed_page orelse continue;
 
-        // 2. If ring buffer is empty, scan frame_table for cold frames
-        if (opt_entry == null) {
-            var f: usize = 0;
-            while (f < pmm.total_frames) : (f += 1) {
-                if (pmm.frame_table[f].state == .cold) {
-                    const phys = @as(u64, @intCast(f)) * memory.PAGE_SIZE;
-                    _ = self.enqueueColdPage(phys);
-                    opt_entry = self.dequeue();
-                    break;
-                }
-            }
-        }
-
-        const entry = opt_entry orelse return null;
-
-        // If this entry references a ManagedPage abstraction
-        if (entry.managed_page) |mp| {
             const handle = mp.compress(pmm, slab_alloc) catch |err| {
                 if (err == error.IncompressiblePage) {
                     // Page is incompressible; eviction is skipped for this page
                 }
                 return null;
             };
+
             var res = entry;
             res.handle = handle;
             res.status = .compressed;
@@ -409,41 +395,7 @@ pub const CompressionRing = struct {
             return res;
         }
 
-        // Otherwise evict raw physical frame
-        const phys = entry.phys_addr;
-        const frame_idx = entry.frame_idx;
-        const virt: [*]const u8 = pmm.physToVirt(phys);
-        const frame_slice = virt[0..memory.PAGE_SIZE];
-
-        if (frame_idx < pmm.total_frames) {
-            pmm.frame_table[frame_idx].state = .compressing;
-        }
-
-        const handle = slab_alloc.compressAndStore(frame_slice) catch |err| {
-            if (frame_idx < pmm.total_frames) {
-                pmm.frame_table[frame_idx].state = .cold;
-            }
-            if (err == error.IncompressiblePage) {
-                // Raw frame is incompressible; eviction is skipped for this frame
-            }
-            return null;
-        };
-
-        const comp_slice = slab_alloc.getCompressed(handle);
-        const comp_len: u32 = if (comp_slice) |s| @intCast(s.len) else 0;
-
-        // Free uncompressed physical frame to PMM free pool
-        pmm.freeFrame(phys);
-
-        var res = entry;
-        res.handle = handle;
-        res.status = .compressed;
-        res.compressed_size = comp_len;
-        _ = @atomicRmw(usize, &self.total_evicted, .Add, 1, .monotonic);
-        _ = @atomicRmw(usize, &self.total_bytes_compressed, .Add, memory.PAGE_SIZE, .monotonic);
-        const saved = if (comp_len < memory.PAGE_SIZE) memory.PAGE_SIZE - comp_len else 0;
-        _ = @atomicRmw(usize, &self.total_bytes_saved, .Add, saved, .monotonic);
-        return res;
+        return null;
     }
 
     /// Evict cold pages until free physical frames meet or exceed target_free
@@ -855,4 +807,60 @@ test "watermark eviction skips incompressible page and continues with compressib
     // Clean up
     incomp_page.deallocate(&pmm, &slab_alloc);
     comp_page.deallocate(&pmm, &slab_alloc);
+}
+
+test "eviction ignores raw frames and does not scavenge pmm frame table" {
+    const mock_ram_size: usize = 2 * 1024 * 1024; // 2 MiB
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: slab.SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    var ring: CompressionRing = .{};
+    ring.init(&pmm, &slab_alloc);
+
+    // 1. Allocate a raw unmanaged frame and mark it cold in pmm
+    const raw_phys = pmm.allocFrame() orelse return error.TestUnexpectedResult;
+    const v: [*]u8 = pmm.physToVirt(raw_phys);
+    @memset(v[0..memory.PAGE_SIZE], 'R');
+    _ = pmm.markCold(raw_phys);
+
+    const initial_free = pmm.free_frames;
+
+    // 2. evictOne with empty ring must NOT scavenge raw frame from pmm frame_table
+    try std.testing.expect(ring.isEmpty());
+    const scavenge_result = ring.evictOne(&pmm, &slab_alloc);
+    try std.testing.expectEqual(@as(?RingEntry, null), scavenge_result);
+    try std.testing.expectEqual(initial_free, pmm.free_frames);
+    try std.testing.expectEqual(memory.PageState.cold, pmm.frame_table[raw_phys / memory.PAGE_SIZE].state);
+
+    // 3. Even if a raw frame was enqueued into the ring, evictOne skips it
+    _ = ring.enqueueColdPage(raw_phys);
+    try std.testing.expectEqual(@as(usize, 1), ring.getCount());
+
+    const queued_raw_result = ring.evictOne(&pmm, &slab_alloc);
+    try std.testing.expectEqual(@as(?RingEntry, null), queued_raw_result);
+    try std.testing.expectEqual(initial_free, pmm.free_frames);
+    try std.testing.expectEqual(memory.PageState.cold, pmm.frame_table[raw_phys / memory.PAGE_SIZE].state);
+
+    // Clean up
+    pmm.freeFrame(raw_phys);
 }
