@@ -98,9 +98,16 @@ pub const ManagedPage = struct {
         const frame_slice = virt[0..memory.PAGE_SIZE];
 
         const handle = slab_alloc.compressAndStore(frame_slice) catch |err| {
-            self.state = .cold;
-            if (frame_idx < pmm.max_frames) {
-                pmm.frame_table[frame_idx].state = .cold;
+            if (err == error.IncompressiblePage) {
+                self.state = .active;
+                if (frame_idx < pmm.max_frames) {
+                    pmm.frame_table[frame_idx].state = .active;
+                }
+            } else {
+                self.state = .cold;
+                if (frame_idx < pmm.max_frames) {
+                    pmm.frame_table[frame_idx].state = .cold;
+                }
             }
             return err;
         };
@@ -376,10 +383,12 @@ pub const CompressionRing = struct {
         // Process entries from circular ring buffer, restricted exclusively to ManagedPage instances
         while (self.dequeue()) |entry| {
             const mp = entry.managed_page orelse continue;
+            if (!mp.isCold()) continue;
 
             const handle = mp.compress(pmm, slab_alloc) catch |err| {
                 if (err == error.IncompressiblePage) {
-                    // Page is incompressible; eviction is skipped for this page
+                    // Page is incompressible; eviction transitions it to active and skips it
+                    continue;
                 }
                 return null;
             };
@@ -732,11 +741,14 @@ test "managed page skips eviction and returns error.IncompressiblePage for high 
     const comp_result = page.compress(&pmm, &slab_alloc);
     try std.testing.expectError(error.IncompressiblePage, comp_result);
 
-    // Eviction was skipped: page remains in physical RAM, frame was not freed
+    // Eviction was skipped: page remains in physical RAM, frame was not freed,
+    // and frame transitions to .active so subsequent passes skip it
     try std.testing.expectEqual(initial_free, pmm.free_frames);
     try std.testing.expectEqual(phys, page.phys_addr);
     try std.testing.expect(!page.isCompressed());
-    try std.testing.expect(page.isCold());
+    try std.testing.expect(page.isActive());
+    try std.testing.expectEqual(memory.PageState.active, page.state);
+    try std.testing.expectEqual(memory.PageState.active, pmm.frame_table[phys / memory.PAGE_SIZE].state);
 
     // Clean up
     page.deallocate(&pmm, &slab_alloc);
@@ -797,9 +809,11 @@ test "watermark eviction skips incompressible page and continues with compressib
     const target_free = pmm.free_frames + 1;
     const evicted = ring.evictUntil(&pmm, &slab_alloc, target_free);
 
-    // Incompressible page was skipped, compressible page was evicted
+    // Incompressible page was skipped and transitioned to .active, compressible page was evicted
     try std.testing.expectEqual(@as(usize, 1), evicted);
-    try std.testing.expect(incomp_page.isCold());
+    try std.testing.expect(incomp_page.isActive());
+    try std.testing.expectEqual(memory.PageState.active, incomp_page.state);
+    try std.testing.expectEqual(memory.PageState.active, pmm.frame_table[p1 / memory.PAGE_SIZE].state);
     try std.testing.expect(incomp_page.phys_addr != 0);
     try std.testing.expect(comp_page.isCompressed());
     try std.testing.expectEqual(@as(u64, 0), comp_page.phys_addr);
@@ -863,4 +877,72 @@ test "eviction ignores raw frames and does not scavenge pmm frame table" {
 
     // Clean up
     pmm.freeFrame(raw_phys);
+}
+
+test "incompressible page transition to active prevents starvation loop in subsequent eviction" {
+    const mock_ram_size: usize = 4 * 1024 * 1024; // 4 MiB = 1024 frames
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: slab.SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    const warmup = slab_alloc.allocCompressed("warmup") orelse return error.TestUnexpectedResult;
+    slab_alloc.freeCompressed(warmup);
+
+    var ring: CompressionRing = .{};
+    ring.init(&pmm, &slab_alloc);
+
+    // Create an incompressible page
+    const p1 = pmm.allocFrame() orelse return error.TestUnexpectedResult;
+    const v1: [*]u8 = pmm.physToVirt(p1);
+    for (v1[0..memory.PAGE_SIZE], 0..) |*b, i| {
+        b.* = @truncate((i *% 101 +% 37) & 0xFF);
+    }
+    var incomp_page = ManagedPage.initActive(p1);
+    _ = incomp_page.markCold(&pmm);
+    _ = ring.enqueueManagedPage(&incomp_page);
+
+    // First eviction pass tries to compress incomp_page and skips it
+    const res1 = ring.evictOne(&pmm, &slab_alloc);
+    try std.testing.expectEqual(@as(?RingEntry, null), res1);
+    try std.testing.expect(incomp_page.isActive());
+    try std.testing.expectEqual(memory.PageState.active, pmm.frame_table[p1 / memory.PAGE_SIZE].state);
+
+    // If incomp_page was re-enqueued, a subsequent eviction pass immediately skips it
+    // because it is .active (not .cold)
+    _ = ring.enqueueManagedPage(&incomp_page);
+
+    // Queue another compressible page after it
+    const p2 = pmm.allocFrame() orelse return error.TestUnexpectedResult;
+    const v2: [*]u8 = pmm.physToVirt(p2);
+    @memset(v2[0..memory.PAGE_SIZE], 'M');
+    var comp_page = ManagedPage.initActive(p2);
+    _ = comp_page.markCold(&pmm);
+    _ = ring.enqueueManagedPage(&comp_page);
+
+    // Next evictOne must immediately skip incomp_page and successfully evict comp_page
+    const res2 = ring.evictOne(&pmm, &slab_alloc);
+    try std.testing.expect(res2 != null);
+    try std.testing.expect(comp_page.isCompressed());
+
+    incomp_page.deallocate(&pmm, &slab_alloc);
+    comp_page.deallocate(&pmm, &slab_alloc);
 }
