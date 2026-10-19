@@ -15,5 +15,9 @@ if ! grep -q "physToVirt" src/memory.zig; then
     exit 1
 fi
 
+if command -v zig >/dev/null 2>&1; then
+    zig test src/memory.zig
+fi
+
 echo "OK: Memory residency and watermark invariants verified in src/memory.zig."
 exit 0
