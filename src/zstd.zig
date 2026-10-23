@@ -11,12 +11,20 @@
 //!   - RLE Blocks (Type 1) for repetitive byte sequences (>= MIN_RLE_RUN bytes)
 //!   - Raw Blocks (Type 0) as fallback for non-uniform chunks
 //!
-//! ### Incompressibility and Header Overhead
+//! ### Incompressibility, Header Accounting, and Truncation Invariants
 //! Because complex entropy coding stages (Finite State Entropy / Huffman) are intentionally
 //! omitted to preserve freestanding bare-metal determinism and avoid dynamic allocation,
 //! high-entropy input pages lacking byte runs cannot achieve compression. In such cases,
 //! RFC 8878 raw block framing appends frame headers (7 bytes) and raw block headers (3 bytes),
 //! expanding a 4096-byte page to 4106 bytes.
+//!
+//! To preserve lossless decompression and framing correctness:
+//!   - **Truncation Guard:** If static chunk capacity is exhausted before scanning the full
+//!     source (`src_pos < src.len`), `compress` immediately takes the single Raw block
+//!     fallback to prevent emitting truncated frames that mismatch the Frame Content Size (FCS).
+//!   - **Frame Header Accounting:** When evaluating whether chunking achieves compression,
+//!     frame header overhead (`out_pos`) is accounted for (`out_pos + total_block_bytes >= src.len`).
+//!     If chunking expands past `src.len`, it immediately falls back to a single Raw block.
 //!
 //! Downstream memory management subsystems (`compressAndStore` and `ManagedPage.compress`)
 //! must verify `comp_len <= memory.PAGE_SIZE`. If `comp_len > memory.PAGE_SIZE`, the page
@@ -122,8 +130,9 @@ pub const ZSTD_CCtx = struct {
 
     /// Compress src into dst using RFC 8878 Zstandard framing (RLE and raw blocks).
     /// Note: This is an RLE frame encoder. If the payload has high entropy and cannot be
-    /// compressed using RLE runs (>= MIN_RLE_RUN), raw framing will be used, producing output
-    /// larger than src.len (up to src.len + 10 bytes for standard single-segment frames).
+    /// compressed using RLE runs (>= MIN_RLE_RUN), or if chunk buffer capacity is reached
+    /// before consuming all input, raw framing will be used, producing output larger than
+    /// src.len (up to src.len + 10 bytes for standard single-segment frames).
     pub fn compress(
         self: *ZSTD_CCtx,
         dst: []u8,

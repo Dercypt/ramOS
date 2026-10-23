@@ -68,7 +68,7 @@ stateDiagram-v2
 
 To prevent memory allocation deadlocks when memory is scarce, compression operates via a lockless circular ring buffer with pre-allocated scratch memory:
 
-1. **Pre-allocated Zstd Context:** `ZSTD_CCtx` and `ZSTD_DCtx` structures are initialized at boot in reserved memory. No heap allocations occur inside the compression path.
+1. **Pre-allocated Zstd Context:** `ZSTD_CCtx` and `ZSTD_DCtx` structures are initialized at boot in reserved memory. No heap allocations occur inside the compression path. The encoder guarantees full input coverage (`src_pos == src.len`) and frame header accounting (`out_pos + total_block_bytes < src.len`), falling back to canonical single raw blocks on workspace exhaustion or frame expansion.
 2. **Synchronous Eviction Path:** When available free physical frames drop below `WATERMARK_LOW` (e.g., 10% of physical RAM), any subsequent allocation call triggers synchronous compression of the oldest `Cold` pages until free frames exceed `WATERMARK_HIGH` (e.g., 20%).
 3. **Zero Disk I/O:** Eviction latency is purely the CPU throughput of Zstandard decompression/compression (~hundreds of MB/s to GB/s on modern AArch64 cores).
 
