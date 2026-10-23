@@ -259,9 +259,9 @@ pub const ZSTD_CCtx = struct {
             }
         }
 
-        // If chunking did not achieve compression or chunk buffer was exhausted before consuming src,
-        // fallback to a single Raw block
-        if (src_pos < src.len or total_block_bytes >= src.len or chunk_count == 0) {
+        // If chunking did not achieve compression (accounting for frame header overhead),
+        // or chunk buffer was exhausted before consuming src, fallback to a single Raw block
+        if (src_pos < src.len or out_pos + total_block_bytes >= src.len or chunk_count == 0) {
             if (dst.len < out_pos + 3 + src.len) return error.DstSizeTooSmall;
             const header_val: u24 = 1 | (0 << 1) | (@as(u24, @intCast(src.len)) << 3);
             dst[out_pos] = @truncate(header_val);
@@ -490,6 +490,38 @@ test "zstd chunk buffer exhaustion falls back to raw block and avoids silent tru
     const comp_len = try cctx.compress(&comp_buf, &payload, 1);
     const decomp_len = try dctx.decompress(&decomp_buf, comp_buf[0..comp_len]);
 
+    try std.testing.expectEqual(@as(usize, 4096), decomp_len);
+    try std.testing.expectEqualSlices(u8, &payload, &decomp_buf);
+}
+
+test "zstd frame header accounting triggers raw fallback when total frame expands past src.len" {
+    var c_ws: [128 * 1024]u8 = undefined;
+    var d_ws: [128 * 1024]u8 = undefined;
+
+    const cctx = (try ZSTD_CCtx.init(&c_ws));
+    const dctx = (try ZSTD_DCtx.init(&d_ws));
+
+    // Payload: 8 bytes run of 'A' + 4088 bytes of non-repeating pattern
+    // Chunk 0: RLE (8 bytes src -> 3-byte header + 1-byte value = 4 bytes)
+    // Chunk 1: Raw (4088 bytes src -> 3-byte header + 4088 bytes payload = 4091 bytes)
+    // total_block_bytes = 4095 (< 4096), but out_pos is 7 bytes (frame header).
+    // Total multi-chunk frame would be 7 + 4095 = 4102 bytes (> 4096).
+    // With frame header accounting (out_pos + total_block_bytes >= src.len),
+    // compress must recognize non-compression and take the single Raw block fallback (4106 bytes).
+    var payload: [4096]u8 = undefined;
+    @memset(payload[0..8], 'A');
+    for (payload[8..], 0..) |*b, i| {
+        b.* = @truncate((i *% 101 +% 37) & 0xFF);
+    }
+
+    var comp_buf: [8192]u8 = undefined;
+    var decomp_buf: [4096]u8 = undefined;
+
+    const comp_len = try cctx.compress(&comp_buf, &payload, 1);
+    // Should fallback to single raw block: frame header (7) + raw block header (3) + payload (4096) = 4106
+    try std.testing.expectEqual(@as(usize, 4106), comp_len);
+
+    const decomp_len = try dctx.decompress(&decomp_buf, comp_buf[0..comp_len]);
     try std.testing.expectEqual(@as(usize, 4096), decomp_len);
     try std.testing.expectEqualSlices(u8, &payload, &decomp_buf);
 }
