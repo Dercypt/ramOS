@@ -318,6 +318,7 @@ pub const Scheduler = struct {
                 ztask.stack_page_count = 0;
             }
         }
+        ztask.state = .unused;
         self.zombie_task = null;
     }
 
@@ -589,6 +590,8 @@ test "deferred stack reclamation via zombie_task on exit" {
     // Reclaim zombie on next task execution
     sched.reclaimZombie(null, null);
     try std.testing.expectEqual(@as(?TaskId, null), sched.zombie_task);
+    try std.testing.expectEqual(TaskState.unused, sched.tasks[1].state);
+    try std.testing.expectEqual(@as(?*Task, null), sched.getTaskById(t1));
 }
 
 test "reclaimZombie deallocates physical stack frames after context switch" {
