@@ -245,7 +245,7 @@ pub const Scheduler = struct {
     pub fn findNextReadyTask(self: *Scheduler, from_task_id: TaskId) ?*Task {
         var start_idx: usize = 0;
         for (&self.tasks, 0..) |*t, i| {
-            if (t.id == from_task_id) {
+            if (t.state != .unused and t.id == from_task_id) {
                 start_idx = (i + 1) % MAX_TASKS;
                 break;
             }
@@ -728,4 +728,44 @@ test "reclaimZombie deallocates physical stack frames after context switch" {
     try std.testing.expectEqual(@as(?TaskId, null), sched.zombie_task);
     // Stack frames are now freed back to PMM
     try std.testing.expectEqual(initial_free, pmm.free_frames);
+}
+
+test "findNextReadyTask skips unused task slots with matching id" {
+    var sched: Scheduler = .{};
+    sched.init();
+
+    // Slot 1 was previously used by task 42, then reclaimed (.unused with stale id = 42).
+    // An active task with id = 42 is in slot 5.
+    sched.tasks[1].id = 42;
+    sched.tasks[1].state = .unused;
+
+    sched.tasks[2].id = 2;
+    sched.tasks[2].state = .ready;
+
+    sched.tasks[3].id = 3;
+    sched.tasks[3].state = .ready;
+
+    sched.tasks[4].id = 4;
+    sched.tasks[4].state = .ready;
+
+    sched.tasks[5].id = 42;
+    sched.tasks[5].state = .ready;
+
+    sched.tasks[6].id = 6;
+    sched.tasks[6].state = .ready;
+
+    // Searching from task 42 must match active slot 5 (start_idx = 6) and pick slot 6 (id = 6),
+    // NOT match unused slot 1 (which would have set start_idx = 2 and picked slot 2).
+    const next = sched.findNextReadyTask(42);
+    try std.testing.expect(next != null);
+    try std.testing.expectEqual(@as(TaskId, 6), next.?.id);
+
+    // Also verify when from_task_id = 0, an unused slot with id = 0 does not hijack start_idx.
+    sched.tasks[0].state = .unused; // slot 0 has id = 0, but state = .unused
+    sched.tasks[4].id = 0;
+    sched.tasks[4].state = .ready;
+    // from_task_id = 0 should match slot 4 (start_idx = 5) and pick slot 5 (id = 42), not slot 0 -> slot 2.
+    const next_from_0 = sched.findNextReadyTask(0);
+    try std.testing.expect(next_from_0 != null);
+    try std.testing.expectEqual(@as(TaskId, 42), next_from_0.?.id);
 }
