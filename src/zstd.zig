@@ -259,8 +259,9 @@ pub const ZSTD_CCtx = struct {
             }
         }
 
-        // If chunking did not achieve compression, fallback to a single Raw block
-        if (total_block_bytes >= src.len or chunk_count == 0) {
+        // If chunking did not achieve compression or chunk buffer was exhausted before consuming src,
+        // fallback to a single Raw block
+        if (src_pos < src.len or total_block_bytes >= src.len or chunk_count == 0) {
             if (dst.len < out_pos + 3 + src.len) return error.DstSizeTooSmall;
             const header_val: u24 = 1 | (0 << 1) | (@as(u24, @intCast(src.len)) << 3);
             dst[out_pos] = @truncate(header_val);
@@ -466,4 +467,29 @@ test "zstd compression and decompression roundtrip" {
     const high_decomp_len = try ZSTD_decompressDCtx(dctx, &decompressed_buf, compressed_buf[0..high_entropy_comp_len]);
     try std.testing.expectEqual(@as(usize, 4096), high_decomp_len);
     try std.testing.expectEqualSlices(u8, &high_entropy_page, &decompressed_buf);
+}
+
+test "zstd chunk buffer exhaustion falls back to raw block and avoids silent truncation" {
+    // Allocate minimum CCtx workspace to bound max_chunks
+    var small_ws: [@sizeOf(ZSTD_CCtx) + 1024]u8 = undefined;
+    var d_ws: [128 * 1024]u8 = undefined;
+
+    const cctx = (try ZSTD_CCtx.init(&small_ws));
+    const dctx = (try ZSTD_DCtx.init(&d_ws));
+
+    // Create 4096-byte payload with many alternating 8-byte runs (exceeding max_chunks)
+    var payload: [4096]u8 = undefined;
+    for (0..4096 / 8) |i| {
+        const val: u8 = @intCast(i % 250);
+        @memset(payload[i * 8 .. (i + 1) * 8], val);
+    }
+
+    var comp_buf: [8192]u8 = undefined;
+    var decomp_buf: [4096]u8 = undefined;
+
+    const comp_len = try cctx.compress(&comp_buf, &payload, 1);
+    const decomp_len = try dctx.decompress(&decomp_buf, comp_buf[0..comp_len]);
+
+    try std.testing.expectEqual(@as(usize, 4096), decomp_len);
+    try std.testing.expectEqualSlices(u8, &payload, &decomp_buf);
 }
