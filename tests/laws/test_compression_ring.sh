@@ -60,6 +60,16 @@ if ! grep -q "compressing" src/memory.zig || ! grep -q "decompressing" src/memor
     exit 1
 fi
 
+if grep -q "Incompressible page state must remain cold" src/main.zig; then
+    echo "ERROR: src/main.zig asserts incompressible page remains cold; it must transition to active."
+    exit 1
+fi
+
+if ! grep -q "Incompressible page state must transition to active" src/main.zig; then
+    echo "ERROR: src/main.zig must assert incompressible page transitions to active."
+    exit 1
+fi
+
 if command -v zig >/dev/null 2>&1; then
     zig test src/ring.zig
 fi
