@@ -352,6 +352,12 @@ pub const ScratchArena = struct {
 };
 
 pub const MAX_RESERVE_BLOCKS: usize = 64;
+
+/// Legacy class index previously used for dedicated 4 KiB emergency single-frame allocations.
+/// Emergency single-frame allocation was removed because dedicating an entire 4 KiB frame
+/// to store a single compressed page resulted in zero net frames reclaimed during low-memory
+/// eviction (allocating 1 frame from PMM to free 1 frame).
+/// Retained strictly for backwards-compatible cleanup in freeCompressed.
 pub const EMERGENCY_CLASS_IDX: u8 = 0xFF;
 
 /// Global In-RAM Slab Allocator managing fixed-size caches for variable-length compressed chunks
@@ -455,8 +461,9 @@ pub const SlabAllocator = struct {
     }
 
     /// Store a compressed page payload in the slab pool and return a PageHandle.
-    /// Falls back to allocating single 4 KiB frames for emergency slab storage
-    /// when under memory pressure and 16 contiguous frames are unavailable.
+    /// Allocates from standard or reserve slab caches. Returns null if slab caches
+    /// are exhausted or cannot allocate contiguous blocks, preventing zero-net-gain
+    /// emergency single-frame allocations during eviction.
     pub fn allocCompressed(self: *SlabAllocator, data: []const u8) ?PageHandle {
         if (data.len == 0 or data.len > memory.PAGE_SIZE) return null;
         const class_idx = sizeToClassIndex(data.len) orelse return null;
@@ -464,15 +471,12 @@ pub const SlabAllocator = struct {
         // 1. Try standard / reserve slab cache allocation
         if (self.caches[class_idx].alloc(self.pmm)) |slot| {
             @memcpy(slot[0..data.len], data);
-            return self.handle_mgr.allocHandle(slot, @intCast(data.len), @intCast(class_idx));
-        }
-
-        // 2. Emergency fallback: allocate a single 4 KiB frame for emergency slab storage
-        // when contiguous 64 KiB (16-frame) slab blocks cannot be allocated under memory pressure.
-        if (self.pmm.allocFrame()) |single_phys| {
-            const emergency_ptr: [*]u8 = self.pmm.physToVirt(single_phys);
-            @memcpy(emergency_ptr[0..data.len], data);
-            return self.handle_mgr.allocHandle(emergency_ptr, @intCast(data.len), EMERGENCY_CLASS_IDX);
+            if (self.handle_mgr.allocHandle(slot, @intCast(data.len), @intCast(class_idx))) |handle| {
+                return handle;
+            } else {
+                self.caches[class_idx].free(self.pmm, slot);
+                return null;
+            }
         }
 
         return null;
@@ -486,12 +490,12 @@ pub const SlabAllocator = struct {
     /// Free a compressed page from the slab pool
     pub fn freeCompressed(self: *SlabAllocator, handle: PageHandle) void {
         if (self.handle_mgr.freeHandle(handle)) |entry| {
-            if (entry.class_idx == EMERGENCY_CLASS_IDX) {
-                // Free emergency single 4 KiB frame directly back to PMM
+            if (entry.class_idx < NUM_SIZE_CLASSES) {
+                self.caches[entry.class_idx].free(self.pmm, entry.ptr);
+            } else if (entry.class_idx == EMERGENCY_CLASS_IDX) {
+                // Free legacy emergency single 4 KiB frame directly back to PMM
                 const phys = self.pmm.virtToPhys(@intFromPtr(entry.ptr));
                 self.pmm.freeFrame(phys);
-            } else {
-                self.caches[entry.class_idx].free(self.pmm, entry.ptr);
             }
         }
     }
@@ -735,7 +739,7 @@ test "prevent slab allocation starvation during low-memory eviction with reserve
     }
 }
 
-test "emergency single frame fallback when reserve pool and contiguous memory are exhausted" {
+test "allocCompressed returns null without consuming single physical frames when slab blocks are exhausted" {
     const std = @import("std");
     const limine = @import("limine.zig");
 
@@ -767,7 +771,7 @@ test "emergency single frame fallback when reserve pool and contiguous memory ar
     while (slab_alloc.popReserveBlock()) |_| {}
 
     // Fill all 15 slots of the 4096 size class with 3500-byte payloads
-    var handles: [16]PageHandle = undefined;
+    var handles: [15]PageHandle = undefined;
     var payload: [3500]u8 = undefined;
     @memset(&payload, 0x42);
 
@@ -785,19 +789,58 @@ test "emergency single frame fallback when reserve pool and contiguous memory ar
     // Contiguous 16 frames unavailable:
     try std.testing.expectEqual(@as(?u64, null), pmm.allocContiguousFrames(SLAB_FRAMES_PER_BLOCK, SLAB_FRAMES_PER_BLOCK));
 
-    // Storing a 16th page must fall back to emergency single frame
-    handles[15] = slab_alloc.allocCompressed(&payload) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(handles[15].isValid());
+    const free_before = pmm.free_frames;
 
-    // Verify it is tracked as emergency
-    const entry = slab_alloc.handle_mgr.entries[handles[15].id];
-    try std.testing.expectEqual(EMERGENCY_CLASS_IDX, entry.class_idx);
+    // Storing a 16th page must return null and NOT consume a single frame (zero-net-gain prevention)
+    const result = slab_alloc.allocCompressed(&payload);
+    try std.testing.expectEqual(@as(?PageHandle, null), result);
 
-    // Verify retrieved slice and clean up
-    const retrieved = slab_alloc.getCompressed(handles[15]) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualSlices(u8, &payload, retrieved);
+    // Verify no single frame was consumed from PMM
+    try std.testing.expectEqual(free_before, pmm.free_frames);
 
     for (handles) |h| {
         slab_alloc.freeCompressed(h);
     }
+}
+
+test "allocCompressed reclaims allocated slab slot when handle table is exhausted" {
+    const std = @import("std");
+    const limine = @import("limine.zig");
+
+    const mock_ram_size: usize = 2 * 1024 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    const class_idx = sizeToClassIndex(64).?;
+    const initial_active = slab_alloc.caches[class_idx].active_allocations;
+
+    // Simulate handle exhaustion by invalidating free_head
+    slab_alloc.handle_mgr.free_head = 0;
+
+    const payload = [_]u8{0x5A} ** 64;
+    const result = slab_alloc.allocCompressed(&payload);
+
+    try std.testing.expectEqual(@as(?PageHandle, null), result);
+    // Ensure the slot allocated in slab_alloc.caches was freed back and not leaked
+    try std.testing.expectEqual(initial_active, slab_alloc.caches[class_idx].active_allocations);
 }

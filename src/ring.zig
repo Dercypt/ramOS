@@ -423,8 +423,8 @@ pub const CompressionRing = struct {
         while (pmm.free_frames < target_free and max_attempts > 0) : (max_attempts -= 1) {
             if (self.evictOne(pmm, slab_alloc) != null) {
                 evicted_count += 1;
-            } else if (self.isEmpty()) {
-                break; // No more queued pages to attempt
+            } else {
+                break; // No progress possible (ring empty or compression pool exhausted)
             }
         }
         return evicted_count;
@@ -945,4 +945,88 @@ test "incompressible page transition to active prevents starvation loop in subse
 
     incomp_page.deallocate(&pmm, &slab_alloc);
     comp_page.deallocate(&pmm, &slab_alloc);
+}
+
+test "eviction halts cleanly when slab pool is exhausted without zero-gain emergency frames" {
+    const mock_ram_size: usize = 4 * 1024 * 1024; // 4 MiB = 1024 frames
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: slab.SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    const warmup = slab_alloc.allocCompressed("warmup") orelse return error.TestUnexpectedResult;
+    slab_alloc.freeCompressed(warmup);
+
+    var ring: CompressionRing = .{};
+    ring.init(&pmm, &slab_alloc);
+
+    // Deplete reserve blocks in slab_alloc
+    while (slab_alloc.popReserveBlock()) |_| {}
+
+    // Allocate frame for the cold test page before draining PMM
+    const p1 = pmm.allocFrame() orelse return error.TestUnexpectedResult;
+    const v1: [*]u8 = pmm.physToVirt(p1);
+    @memset(v1[0..memory.PAGE_SIZE], 'A');
+    var comp_page = ManagedPage.initActive(p1);
+    _ = comp_page.markCold(&pmm);
+    _ = ring.enqueueManagedPage(&comp_page);
+
+    // Drain PMM so fewer than 16 contiguous frames remain; slab allocator cannot allocate new blocks
+    while (pmm.free_frames > 3) {
+        _ = pmm.allocFrame() orelse break;
+    }
+    try std.testing.expectEqual(@as(?u64, null), pmm.allocContiguousFrames(slab.SLAB_FRAMES_PER_BLOCK, slab.SLAB_FRAMES_PER_BLOCK));
+
+    // Exhaust all remaining slots across existing pre-allocated size classes
+    var dummy_handles: [2500]slab.PageHandle = undefined;
+    var dummy_count: usize = 0;
+    for (&slab_alloc.caches, 0..) |*cache, c_idx| {
+        while (cache.alloc(&pmm)) |slot| {
+            if (slab_alloc.handle_mgr.allocHandle(slot, 16, @intCast(c_idx))) |h| {
+                dummy_handles[dummy_count] = h;
+                dummy_count += 1;
+            } else {
+                cache.free(&pmm, slot);
+                break;
+            }
+        }
+    }
+
+    const free_before = pmm.free_frames;
+
+    // Eviction attempt must return 0 because slab pool cannot allocate,
+    // and must NOT consume a single frame for emergency storage (zero net gain).
+    const evicted = ring.evictUntil(&pmm, &slab_alloc, pmm.watermark_high);
+    try std.testing.expectEqual(@as(usize, 0), evicted);
+
+    // Free frames must not have been consumed
+    try std.testing.expectEqual(free_before, pmm.free_frames);
+
+    // Page should remain cold and unevicted
+    try std.testing.expect(comp_page.isCold());
+
+    // Clean up
+    comp_page.deallocate(&pmm, &slab_alloc);
+    var d: usize = 0;
+    while (d < dummy_count) : (d += 1) {
+        slab_alloc.freeCompressed(dummy_handles[d]);
+    }
 }
