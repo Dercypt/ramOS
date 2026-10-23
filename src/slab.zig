@@ -464,7 +464,12 @@ pub const SlabAllocator = struct {
         // 1. Try standard / reserve slab cache allocation
         if (self.caches[class_idx].alloc(self.pmm)) |slot| {
             @memcpy(slot[0..data.len], data);
-            return self.handle_mgr.allocHandle(slot, @intCast(data.len), @intCast(class_idx));
+            if (self.handle_mgr.allocHandle(slot, @intCast(data.len), @intCast(class_idx))) |handle| {
+                return handle;
+            } else {
+                self.caches[class_idx].free(self.pmm, slot);
+                return null;
+            }
         }
 
         // 2. Emergency fallback: allocate a single 4 KiB frame for emergency slab storage
@@ -472,7 +477,12 @@ pub const SlabAllocator = struct {
         if (self.pmm.allocFrame()) |single_phys| {
             const emergency_ptr: [*]u8 = self.pmm.physToVirt(single_phys);
             @memcpy(emergency_ptr[0..data.len], data);
-            return self.handle_mgr.allocHandle(emergency_ptr, @intCast(data.len), EMERGENCY_CLASS_IDX);
+            if (self.handle_mgr.allocHandle(emergency_ptr, @intCast(data.len), EMERGENCY_CLASS_IDX)) |handle| {
+                return handle;
+            } else {
+                self.pmm.freeFrame(single_phys);
+                return null;
+            }
         }
 
         return null;
@@ -800,4 +810,46 @@ test "emergency single frame fallback when reserve pool and contiguous memory ar
     for (handles) |h| {
         slab_alloc.freeCompressed(h);
     }
+}
+
+test "allocCompressed reclaims allocated slab slot when handle table is exhausted" {
+    const std = @import("std");
+    const limine = @import("limine.zig");
+
+    const mock_ram_size: usize = 2 * 1024 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    const class_idx = sizeToClassIndex(64).?;
+    const initial_active = slab_alloc.caches[class_idx].active_allocations;
+
+    // Simulate handle exhaustion by invalidating free_head
+    slab_alloc.handle_mgr.free_head = 0;
+
+    const payload = [_]u8{0x5A} ** 64;
+    const result = slab_alloc.allocCompressed(&payload);
+
+    try std.testing.expectEqual(@as(?PageHandle, null), result);
+    // Ensure the slot allocated in slab_alloc.caches was freed back and not leaked
+    try std.testing.expectEqual(initial_active, slab_alloc.caches[class_idx].active_allocations);
 }
