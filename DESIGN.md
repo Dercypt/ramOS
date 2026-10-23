@@ -40,6 +40,7 @@ stateDiagram-v2
     Active --> Cold: ManagedPage.markCold()
     Cold --> Compressing: Eviction / Ring Dequeue
     Compressing --> Compressed: Zstd Compress, pmm.freeFrame(), Store PageHandle
+    Compressing --> Active: Incompressible (error.IncompressiblePage)
     Compressed --> Decompressing: ManagedPage.access() / Fault
     Decompressing --> Active: pmm.allocFrame() & Zstd Decompress
     Active --> [*]: ManagedPage.deallocate()
@@ -49,7 +50,7 @@ stateDiagram-v2
 ### ManagedPage States:
 - **`Active`:** Backed by an active physical frame (`phys_addr != 0`, `handle = invalid`).
 - **`Cold`:** Inactive, candidate for compression when low-water mark is hit.
-- **`Compressing`:** Currently processing in the compression ring.
+- **`Compressing`:** Currently processing in the compression ring. If compression fails due to high entropy (`error.IncompressiblePage`), transitions back to `Active` to prevent repetitive eviction sweeps.
 - **`Compressed`:** Physical frame freed back to PMM (`phys_addr = 0`); payload stored as a compact slice in the slab pool with a `PageHandle`.
 - **`Decompressing`:** Synchronously allocating a fresh physical frame from PMM and restoring payload.
 - **`Free`:** Unallocated / deallocated upon task exit.
