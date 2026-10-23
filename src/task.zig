@@ -241,18 +241,11 @@ pub const Scheduler = struct {
         return task_id;
     }
 
-    /// Yield execution cooperatively to the next ready task.
-    /// Strictly maintains Law of the Single Flat Space: switches registers only,
-    /// no TTBR0/1 or TLB flushes.
-    pub fn yield(self: *Scheduler) void {
-        const cur_id = self.current_task_id orelse return;
-        const cur_task = self.getTaskById(cur_id) orelse return;
-
-        // Find next ready task (Round-Robin)
-        var next_task: ?*Task = null;
+    /// Find the next ready task in round-robin order starting after the specified task ID.
+    pub fn findNextReadyTask(self: *Scheduler, from_task_id: TaskId) ?*Task {
         var start_idx: usize = 0;
         for (&self.tasks, 0..) |*t, i| {
-            if (t.id == cur_id) {
+            if (t.id == from_task_id) {
                 start_idx = (i + 1) % MAX_TASKS;
                 break;
             }
@@ -263,12 +256,21 @@ pub const Scheduler = struct {
             const check_idx = (start_idx + i) % MAX_TASKS;
             const candidate = &self.tasks[check_idx];
             if (candidate.state == .ready) {
-                next_task = candidate;
-                break;
+                return candidate;
             }
         }
+        return null;
+    }
 
-        const next = next_task orelse return;
+    /// Yield execution cooperatively to the next ready task.
+    /// Strictly maintains Law of the Single Flat Space: switches registers only,
+    /// no TTBR0/1 or TLB flushes.
+    pub fn yield(self: *Scheduler) void {
+        const cur_id = self.current_task_id orelse return;
+        const cur_task = self.getTaskById(cur_id) orelse return;
+
+        // Find next ready task (Round-Robin)
+        const next = self.findNextReadyTask(cur_id) orelse return;
 
         // Perform context switch
         if (cur_task.state == .running) {
@@ -292,8 +294,9 @@ pub const Scheduler = struct {
         self.reclaimZombie(self.pmm orelse (if (builtin.os.tag == .freestanding) &memory.global_pmm else null), self.slab_alloc orelse (if (builtin.os.tag == .freestanding) &memory.slab.global_slab else null));
     }
 
-    /// Free deferred stack frames of a terminated task.
+    /// Free deferred stack frames of a terminated task and recycle its slot.
     /// Executed on the stack of the next scheduled task or idle loop to avoid use-after-free.
+    /// Resets ztask.state to .unused so the task slot can be reused by spawn(), preventing MAX_TASKS exhaustion.
     pub fn reclaimZombie(self: *Scheduler, pmm: ?*memory.PhysicalMemoryManager, slab_alloc: ?*memory.slab.SlabAllocator) void {
         const zid = self.zombie_task orelse return;
         const ztask = self.getTaskById(zid) orelse {
@@ -318,11 +321,13 @@ pub const Scheduler = struct {
                 ztask.stack_page_count = 0;
             }
         }
+        ztask.state = .unused;
         self.zombie_task = null;
     }
 
-    /// Terminate current task and switch to the next ready task.
+    /// Terminate current task and switch to the next ready task in round-robin order.
     /// Defers stack reclamation to prevent use-after-free while executing on the current task's stack.
+    /// Uses circular round-robin search starting after the exiting task's slot to preserve scheduling fairness.
     pub fn exit(self: *Scheduler, pmm: ?*memory.PhysicalMemoryManager, slab_alloc: ?*memory.slab.SlabAllocator) noreturn {
         const cur_id = self.current_task_id orelse {
             while (true) {}
@@ -339,14 +344,8 @@ pub const Scheduler = struct {
         if (pmm) |p| self.pmm = p;
         if (slab_alloc) |s| self.slab_alloc = s;
 
-        // Find next ready task
-        var next_task: ?*Task = null;
-        for (&self.tasks) |*t| {
-            if (t.state == .ready) {
-                next_task = t;
-                break;
-            }
-        }
+        // Find next ready task (Round-Robin)
+        const next_task = self.findNextReadyTask(cur_id);
 
         if (next_task) |next| {
             next.state = .running;
@@ -564,6 +563,67 @@ test "cooperative round-robin scheduling transitions" {
     try std.testing.expectEqual(@as(u64, 3), sched.switch_count);
 }
 
+test "round-robin task selection on exit resumes next ready task in circular order" {
+    var sched: Scheduler = .{};
+    sched.init();
+
+    const dummyEntry = struct {
+        fn run(arg: u64) void {
+            _ = arg;
+        }
+    }.run;
+
+    const t1 = sched.spawnStatic(dummyEntry, 10, "worker_1") orelse return error.TestUnexpectedResult;
+    const t2 = sched.spawnStatic(dummyEntry, 20, "worker_2") orelse return error.TestUnexpectedResult;
+
+    // Simulate kernel_main (slot 0) yielding to t1
+    sched.getTaskById(0).?.state = .ready;
+    sched.getTaskById(t1).?.state = .running;
+    sched.current_task_id = t1;
+
+    // When t1 exits, round-robin scan starting after slot 1 picks t2 (slot 2), not slot 0
+    sched.getTaskById(t1).?.state = .terminated;
+    const next_after_t1 = sched.findNextReadyTask(t1);
+    try std.testing.expect(next_after_t1 != null);
+    try std.testing.expectEqual(t2, next_after_t1.?.id);
+
+    // When t2 runs and exits, round-robin scan starting after slot 2 wraps around to slot 0 (kernel_main)
+    sched.getTaskById(t2).?.state = .terminated;
+    const next_after_t2 = sched.findNextReadyTask(t2);
+    try std.testing.expect(next_after_t2 != null);
+    try std.testing.expectEqual(@as(TaskId, 0), next_after_t2.?.id);
+}
+
+test "round-robin exit wraps around task table boundary and handles empty ready set" {
+    var sched: Scheduler = .{};
+    sched.init();
+
+    // Mark task 0 (kernel_main) as terminated
+    sched.getTaskById(0).?.state = .terminated;
+
+    // With no tasks ready, findNextReadyTask returns null
+    try std.testing.expectEqual(@as(?*Task, null), sched.findNextReadyTask(0));
+
+    // Place a ready task at the very end of tasks array (slot MAX_TASKS - 1)
+    const last_slot = MAX_TASKS - 1;
+    sched.tasks[last_slot].id = 999;
+    sched.tasks[last_slot].state = .ready;
+
+    // Place a ready task at slot 5
+    sched.tasks[5].id = 555;
+    sched.tasks[5].state = .ready;
+
+    // When last_slot exits, search wraps around index 0 and finds slot 5
+    sched.tasks[last_slot].state = .terminated;
+    const next = sched.findNextReadyTask(999);
+    try std.testing.expect(next != null);
+    try std.testing.expectEqual(@as(TaskId, 555), next.?.id);
+
+    // When slot 5 terminates, search from slot 5 finds nothing and returns null
+    sched.tasks[5].state = .terminated;
+    try std.testing.expectEqual(@as(?*Task, null), sched.findNextReadyTask(555));
+}
+
 test "deferred stack reclamation via zombie_task on exit" {
     var sched: Scheduler = .{};
     sched.init();
@@ -589,6 +649,37 @@ test "deferred stack reclamation via zombie_task on exit" {
     // Reclaim zombie on next task execution
     sched.reclaimZombie(null, null);
     try std.testing.expectEqual(@as(?TaskId, null), sched.zombie_task);
+    try std.testing.expectEqual(TaskState.unused, sched.tasks[1].state);
+    try std.testing.expectEqual(@as(?*Task, null), sched.getTaskById(t1));
+}
+
+test "task slot reuse after zombie reclamation prevents MAX_TASKS exhaustion" {
+    var sched: Scheduler = .{};
+    sched.init();
+
+    const dummyEntry = struct {
+        fn run(arg: u64) void {
+            _ = arg;
+        }
+    }.run;
+
+    // Sequentially spawn, terminate, and reclaim tasks well past MAX_TASKS (e.g., 100 cycles)
+    var cycle: usize = 0;
+    while (cycle < 100) : (cycle += 1) {
+        const tid = sched.spawnStatic(dummyEntry, @as(u64, cycle), "worker_cycle") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 2), sched.task_count);
+
+        // Terminate and defer reclamation
+        sched.current_task_id = tid;
+        sched.getTaskById(tid).?.state = .terminated;
+        sched.zombie_task = tid;
+        sched.task_count -= 1;
+
+        // Reclaim zombie, freeing the slot to .unused
+        sched.reclaimZombie(null, null);
+        try std.testing.expectEqual(@as(?TaskId, null), sched.zombie_task);
+        try std.testing.expectEqual(TaskState.unused, sched.tasks[1].state);
+    }
 }
 
 test "reclaimZombie deallocates physical stack frames after context switch" {
