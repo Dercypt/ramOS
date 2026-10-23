@@ -294,8 +294,9 @@ pub const Scheduler = struct {
         self.reclaimZombie(self.pmm orelse (if (builtin.os.tag == .freestanding) &memory.global_pmm else null), self.slab_alloc orelse (if (builtin.os.tag == .freestanding) &memory.slab.global_slab else null));
     }
 
-    /// Free deferred stack frames of a terminated task.
+    /// Free deferred stack frames of a terminated task and recycle its slot.
     /// Executed on the stack of the next scheduled task or idle loop to avoid use-after-free.
+    /// Resets ztask.state to .unused so the task slot can be reused by spawn(), preventing MAX_TASKS exhaustion.
     pub fn reclaimZombie(self: *Scheduler, pmm: ?*memory.PhysicalMemoryManager, slab_alloc: ?*memory.slab.SlabAllocator) void {
         const zid = self.zombie_task orelse return;
         const ztask = self.getTaskById(zid) orelse {
@@ -324,8 +325,9 @@ pub const Scheduler = struct {
         self.zombie_task = null;
     }
 
-    /// Terminate current task and switch to the next ready task.
+    /// Terminate current task and switch to the next ready task in round-robin order.
     /// Defers stack reclamation to prevent use-after-free while executing on the current task's stack.
+    /// Uses circular round-robin search starting after the exiting task's slot to preserve scheduling fairness.
     pub fn exit(self: *Scheduler, pmm: ?*memory.PhysicalMemoryManager, slab_alloc: ?*memory.slab.SlabAllocator) noreturn {
         const cur_id = self.current_task_id orelse {
             while (true) {}
