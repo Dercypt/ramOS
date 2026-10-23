@@ -525,3 +525,49 @@ test "zstd frame header accounting triggers raw fallback when total frame expand
     try std.testing.expectEqual(@as(usize, 4096), decomp_len);
     try std.testing.expectEqualSlices(u8, &payload, &decomp_buf);
 }
+
+test "zstd edge cases: small payloads and compression threshold boundary" {
+    var c_ws: [128 * 1024]u8 = undefined;
+    var d_ws: [128 * 1024]u8 = undefined;
+
+    const cctx = (try ZSTD_CCtx.init(&c_ws));
+    const dctx = (try ZSTD_DCtx.init(&d_ws));
+
+    // Case A: Small payload (<= 255 bytes, 6-byte frame header) where block headers cause expansion
+    // src.len = 64: 8 bytes 'A' + 56 bytes raw
+    // Chunk 0 (RLE): 4 bytes, Chunk 1 (Raw): 59 bytes. total_block_bytes = 63 (< 64).
+    // out_pos + total_block_bytes = 6 + 63 = 69 (>= 64).
+    // Must fall back to raw block: 6 (frame header) + 3 (block header) + 64 = 73 bytes.
+    var small_payload: [64]u8 = undefined;
+    @memset(small_payload[0..8], 'A');
+    for (small_payload[8..], 0..) |*b, i| {
+        b.* = @truncate((i *% 101 +% 37) & 0xFF);
+    }
+
+    var comp_buf: [8192]u8 = undefined;
+    var decomp_buf: [4096]u8 = undefined;
+
+    const small_comp_len = try cctx.compress(&comp_buf, &small_payload, 1);
+    try std.testing.expectEqual(@as(usize, 73), small_comp_len);
+
+    const small_decomp_len = try dctx.decompress(&decomp_buf, comp_buf[0..small_comp_len]);
+    try std.testing.expectEqual(@as(usize, 64), small_decomp_len);
+    try std.testing.expectEqualSlices(u8, &small_payload, decomp_buf[0..small_decomp_len]);
+
+    // Case B: Boundary where multi-chunk encoding genuinely beats src.len
+    // 32 bytes 'A' (4 bytes) + 4064 bytes raw (4067 bytes).
+    // total_block_bytes = 4071. out_pos (7) + 4071 = 4078 (< 4096).
+    // Must retain multi-chunk encoding without raw fallback.
+    var compressible_payload: [4096]u8 = undefined;
+    @memset(compressible_payload[0..32], 'A');
+    for (compressible_payload[32..], 0..) |*b, i| {
+        b.* = @truncate((i *% 101 +% 37) & 0xFF);
+    }
+
+    const comp_bound_len = try cctx.compress(&comp_buf, &compressible_payload, 1);
+    try std.testing.expectEqual(@as(usize, 4078), comp_bound_len);
+
+    const decomp_bound_len = try dctx.decompress(&decomp_buf, comp_buf[0..comp_bound_len]);
+    try std.testing.expectEqual(@as(usize, 4096), decomp_bound_len);
+    try std.testing.expectEqualSlices(u8, &compressible_payload, decomp_buf[0..decomp_bound_len]);
+}
