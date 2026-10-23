@@ -592,6 +592,36 @@ test "round-robin task selection on exit resumes next ready task in circular ord
     try std.testing.expectEqual(@as(TaskId, 0), next_after_t2.?.id);
 }
 
+test "round-robin exit wraps around task table boundary and handles empty ready set" {
+    var sched: Scheduler = .{};
+    sched.init();
+
+    // Mark task 0 (kernel_main) as terminated
+    sched.getTaskById(0).?.state = .terminated;
+
+    // With no tasks ready, findNextReadyTask returns null
+    try std.testing.expectEqual(@as(?*Task, null), sched.findNextReadyTask(0));
+
+    // Place a ready task at the very end of tasks array (slot MAX_TASKS - 1)
+    const last_slot = MAX_TASKS - 1;
+    sched.tasks[last_slot].id = 999;
+    sched.tasks[last_slot].state = .ready;
+
+    // Place a ready task at slot 5
+    sched.tasks[5].id = 555;
+    sched.tasks[5].state = .ready;
+
+    // When last_slot exits, search wraps around index 0 and finds slot 5
+    sched.tasks[last_slot].state = .terminated;
+    const next = sched.findNextReadyTask(999);
+    try std.testing.expect(next != null);
+    try std.testing.expectEqual(@as(TaskId, 555), next.?.id);
+
+    // When slot 5 terminates, search from slot 5 finds nothing and returns null
+    sched.tasks[5].state = .terminated;
+    try std.testing.expectEqual(@as(?*Task, null), sched.findNextReadyTask(555));
+}
+
 test "deferred stack reclamation via zombie_task on exit" {
     var sched: Scheduler = .{};
     sched.init();
