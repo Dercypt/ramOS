@@ -594,6 +594,35 @@ test "deferred stack reclamation via zombie_task on exit" {
     try std.testing.expectEqual(@as(?*Task, null), sched.getTaskById(t1));
 }
 
+test "task slot reuse after zombie reclamation prevents MAX_TASKS exhaustion" {
+    var sched: Scheduler = .{};
+    sched.init();
+
+    const dummyEntry = struct {
+        fn run(arg: u64) void {
+            _ = arg;
+        }
+    }.run;
+
+    // Sequentially spawn, terminate, and reclaim tasks well past MAX_TASKS (e.g., 100 cycles)
+    var cycle: usize = 0;
+    while (cycle < 100) : (cycle += 1) {
+        const tid = sched.spawnStatic(dummyEntry, @as(u64, cycle), "worker_cycle") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 2), sched.task_count);
+
+        // Terminate and defer reclamation
+        sched.current_task_id = tid;
+        sched.getTaskById(tid).?.state = .terminated;
+        sched.zombie_task = tid;
+        sched.task_count -= 1;
+
+        // Reclaim zombie, freeing the slot to .unused
+        sched.reclaimZombie(null, null);
+        try std.testing.expectEqual(@as(?TaskId, null), sched.zombie_task);
+        try std.testing.expectEqual(TaskState.unused, sched.tasks[1].state);
+    }
+}
+
 test "reclaimZombie deallocates physical stack frames after context switch" {
     const limine = @import("limine.zig");
     const mock_ram_size: usize = 2 * 1024 * 1024;
