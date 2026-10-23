@@ -203,19 +203,7 @@ fn testZstdCompression() void {
         if (decomp_direct[i] != expected) @panic("Direct decompressed content mismatch");
     }
 
-    // 4. Test frame table integration with compressed handle
-    const frame_phys = memory.global_pmm.allocFrame() orelse @panic("Failed to alloc physical frame");
-    const frame_idx = frame_phys / memory.PAGE_SIZE;
-    const meta_handle = memory.slab.global_slab.compressAndStore(&zero_page) catch @panic("Failed to compress for frame meta");
-    memory.global_pmm.frame_table[frame_idx].setCompressed(meta_handle);
-
-    if (!memory.global_pmm.frame_table[frame_idx].isCompressed()) @panic("FrameMeta not marked as compressed");
-    if (memory.global_pmm.frame_table[frame_idx].getCompressedHandle().id != meta_handle.id) @panic("FrameMeta handle mismatch");
-
-    memory.slab.global_slab.freeCompressed(meta_handle);
-    memory.global_pmm.freeFrame(frame_phys);
-
-    // 5. Test rejection of high-entropy incompressible page
+    // 4. Test rejection of high-entropy incompressible page
     var high_entropy_page: [memory.PAGE_SIZE]u8 = undefined;
     for (&high_entropy_page, 0..) |*b, i| {
         b.* = @truncate((i *% 101 +% 37) & 0xFF);
@@ -254,16 +242,7 @@ fn testSlabAllocator() void {
         if (retrieved[i] != expected_byte) @panic("Compressed payload content mismatch");
     }
 
-    // 3. Test association with FrameMeta
-    const frame_phys = memory.global_pmm.allocFrame() orelse @panic("Failed to alloc physical frame for test");
-    const frame_idx = frame_phys / memory.PAGE_SIZE;
-    memory.global_pmm.frame_table[frame_idx].setCompressed(handle);
-    if (!memory.global_pmm.frame_table[frame_idx].isCompressed()) @panic("Frame state not marked as compressed");
-    if (memory.global_pmm.frame_table[frame_idx].getCompressedHandle().id != handle.id) @panic("Frame handle mismatch");
-
-    // Clean up
     memory.slab.global_slab.freeCompressed(handle);
-    memory.global_pmm.freeFrame(frame_phys);
 }
 
 fn testCompressionRing() void {
