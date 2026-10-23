@@ -356,7 +356,7 @@ fn testCompressionRing() void {
     }
 
     // Ensure physical frame is preserved and eviction was skipped
-    if (!incomp_page.isCold()) @panic("Incompressible page state must remain cold");
+    if (!incomp_page.isActive()) @panic("Incompressible page state must transition to active");
     if (incomp_page.phys_addr != phys_incomp) @panic("Incompressible page physical address must be retained");
 
     incomp_page.deallocate(&memory.global_pmm, &memory.slab.global_slab);
