@@ -328,20 +328,6 @@ pub const CompressionRing = struct {
         }
     }
 
-    /// Enqueue a cold physical frame by physical address
-    pub fn enqueueColdPage(self: *CompressionRing, phys_addr: u64) bool {
-        const frame_idx = phys_addr / memory.PAGE_SIZE;
-        return self.enqueue(.{
-            .frame_idx = frame_idx,
-            .phys_addr = phys_addr,
-            .handle = slab.PageHandle.invalid,
-            .compressed_size = 0,
-            .managed_page = null,
-            .status = .pending,
-            .sequence = @intCast(self.total_enqueued),
-        });
-    }
-
     /// Enqueue a candidate ManagedPage
     pub fn enqueueManagedPage(self: *CompressionRing, page: *ManagedPage) bool {
         const frame_idx = page.phys_addr / memory.PAGE_SIZE;
@@ -866,8 +852,13 @@ test "eviction ignores raw frames and does not scavenge pmm frame table" {
     try std.testing.expectEqual(initial_free, pmm.free_frames);
     try std.testing.expectEqual(memory.PageState.cold, pmm.frame_table[raw_phys / memory.PAGE_SIZE].state);
 
-    // 3. Even if a raw frame was enqueued into the ring, evictOne skips it
-    _ = ring.enqueueColdPage(raw_phys);
+    // 3. Even if a raw entry without a managed page was enqueued into the ring, evictOne skips it
+    _ = ring.enqueue(.{
+        .frame_idx = raw_phys / memory.PAGE_SIZE,
+        .phys_addr = raw_phys,
+        .managed_page = null,
+        .status = .pending,
+    });
     try std.testing.expectEqual(@as(usize, 1), ring.getCount());
 
     const queued_raw_result = ring.evictOne(&pmm, &slab_alloc);
