@@ -340,11 +340,22 @@ pub const Scheduler = struct {
         if (pmm) |p| self.pmm = p;
         if (slab_alloc) |s| self.slab_alloc = s;
 
-        // Find next ready task
+        // Find next ready task (Round-Robin)
         var next_task: ?*Task = null;
-        for (&self.tasks) |*t| {
-            if (t.state == .ready) {
-                next_task = t;
+        var start_idx: usize = 0;
+        for (&self.tasks, 0..) |*t, i| {
+            if (t.id == cur_id) {
+                start_idx = (i + 1) % MAX_TASKS;
+                break;
+            }
+        }
+
+        var i: usize = 0;
+        while (i < MAX_TASKS) : (i += 1) {
+            const check_idx = (start_idx + i) % MAX_TASKS;
+            const candidate = &self.tasks[check_idx];
+            if (candidate.state == .ready) {
+                next_task = candidate;
                 break;
             }
         }
