@@ -352,6 +352,12 @@ pub const ScratchArena = struct {
 };
 
 pub const MAX_RESERVE_BLOCKS: usize = 64;
+
+/// Legacy class index previously used for dedicated 4 KiB emergency single-frame allocations.
+/// Emergency single-frame allocation was removed because dedicating an entire 4 KiB frame
+/// to store a single compressed page resulted in zero net frames reclaimed during low-memory
+/// eviction (allocating 1 frame from PMM to free 1 frame).
+/// Retained strictly for backwards-compatible cleanup in freeCompressed.
 pub const EMERGENCY_CLASS_IDX: u8 = 0xFF;
 
 /// Global In-RAM Slab Allocator managing fixed-size caches for variable-length compressed chunks
