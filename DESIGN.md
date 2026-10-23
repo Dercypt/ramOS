@@ -29,28 +29,37 @@ Limine maps all available physical memory to a higher-half virtual base (`HHDM_O
 
 ## 3. Page Lifecycle & Compression State Machine
 
-Every physical frame tracked by ramOS possesses a corresponding entry in the global `FrameTable`:
+Page state tracking in ramOS cleanly decouples physical frame allocation (`PhysicalMemoryManager` / `FrameTable`) from the virtual page lifecycle (`ManagedPage`):
+
+- **Physical FrameTable (`PhysicalMemoryManager.frame_table`):** Tracks the physical allocation state of 4 KiB frames in RAM (`free`, `active`, `cold`, `compressing`, `decompressing`, `reserved`). Physical frames never remain in a compressed state: once a page is compressed into the slab pool, its physical frame is returned immediately to `PhysicalMemoryManager.freeFrame()`, resetting its physical frame entry to `free`.
+- **Managed Virtual Pages (`ManagedPage`):** Owns the virtual lifecycle and holds the `PageHandle` referencing the compressed chunk in the slab pool once the physical frame is released back to PMM.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Free: Boot Discovery
-    Free --> Active: Allocate 4 KiB Frame
-    Active --> Cold: LRU Aging / Inactivity
-    Cold --> Compressing: Low Memory Watermark Hit
-    Compressing --> Compressed: Zstd Compress & Store in Slab
-    Compressed --> Decompressing: Task Access Request
-    Decompressing --> Active: Zstd Decompress to Free Frame
-    Active --> Free: Deallocate / Task Exit
-    Compressed --> Free: Deallocate Handle
+    [*] --> Active: ManagedPage.initActive(phys)
+    Active --> Cold: ManagedPage.markCold()
+    Cold --> Compressing: Eviction / Ring Dequeue
+    Compressing --> Compressed: Zstd Compress, pmm.freeFrame(), Store PageHandle
+    Compressed --> Decompressing: ManagedPage.access() / Fault
+    Decompressing --> Active: pmm.allocFrame() & Zstd Decompress
+    Active --> [*]: ManagedPage.deallocate()
+    Compressed --> [*]: ManagedPage.deallocate() (Free Handle)
 ```
 
-### Frame States:
-- **`Free`:** Available in the physical buddy/bitmap allocator.
-- **`Active`:** In active use by a task.
+### ManagedPage States:
+- **`Active`:** Backed by an active physical frame (`phys_addr != 0`, `handle = invalid`).
 - **`Cold`:** Inactive, candidate for compression when low-water mark is hit.
-- **`Compressing`:** Currently enqueued or processing in the compression ring.
-- **`Compressed`:** Uncompressed frame returned to `Free`; data stored as a compact slice in the slab pool with a `PageHandle`.
-- **`Decompressing`:** Restored synchronously when accessed.
+- **`Compressing`:** Currently processing in the compression ring.
+- **`Compressed`:** Physical frame freed back to PMM (`phys_addr = 0`); payload stored as a compact slice in the slab pool with a `PageHandle`.
+- **`Decompressing`:** Synchronously allocating a fresh physical frame from PMM and restoring payload.
+- **`Free`:** Unallocated / deallocated upon task exit.
+
+### Physical Frame States (`FrameTable`):
+- **`Free`:** Available in the physical bitmap allocator for allocation.
+- **`Active`:** Assigned to an active ManagedPage, stack, or kernel structure.
+- **`Cold`:** Active page marked cold; physical candidate for eviction.
+- **`Compressing` / `Decompressing`:** Transient physical frame states during active (de)compression.
+- **`Reserved`:** Hardware/firmware memory, MMIO, or early boot reservations.
 
 ---
 
