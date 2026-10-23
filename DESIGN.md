@@ -81,6 +81,10 @@ To prevent memory allocation deadlocks when memory is scarce, compression operat
 3. **Safety Layer:**
    - Without hardware MMU page permission bits between tasks, safety and memory bounds are strictly enforced by Zig's compile-time types, slice bounds checking, and `ReleaseSafe` panic traps.
    - Pointers across tasks are managed through capability-style handles or borrow-checked abstractions.
+4. **Task Scheduling & Slot Lifecycle:**
+   - Tasks are scheduled via cooperative round-robin across a bounded task table.
+   - Round-robin search (`findNextReadyTask`) strictly inspects active/ready task slots (`state != .unused`) when locating the predecessor task index to prevent recycled or default-initialized unused slots from hijacking the search start index.
+   - Terminated tasks defer stack deallocation to `reclaimZombie` executed on the next scheduled task context, recycling the slot to `.unused` without leaking task slots.
 
 ---
 
