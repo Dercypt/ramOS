@@ -17,25 +17,10 @@ pub const PageState = enum(u8) {
 pub const FrameMeta = struct {
     state: PageState = .free,
     ref_count: u32 = 0,
-    compressed_handle: u32 = 0, // Points into the Zstd slab pool if compressed
 
     pub fn setReserved(self: *FrameMeta) void {
         self.state = .reserved;
         self.ref_count = 0;
-        self.compressed_handle = 0;
-    }
-
-    pub fn setCompressed(self: *FrameMeta, handle: slab.PageHandle) void {
-        self.state = .compressed;
-        self.compressed_handle = handle.id;
-    }
-
-    pub fn getCompressedHandle(self: *const FrameMeta) slab.PageHandle {
-        return slab.PageHandle.fromU32(self.compressed_handle);
-    }
-
-    pub fn isCompressed(self: *const FrameMeta) bool {
-        return self.state == .compressed and self.compressed_handle != 0;
     }
 
     pub fn setCold(self: *FrameMeta) void {
@@ -57,7 +42,6 @@ pub const FrameMeta = struct {
     pub fn setFree(self: *FrameMeta) void {
         self.state = .free;
         self.ref_count = 0;
-        self.compressed_handle = 0;
     }
 };
 
@@ -159,7 +143,6 @@ pub const PhysicalMemoryManager = struct {
             self.frame_table[f] = .{
                 .state = .reserved,
                 .ref_count = 0,
-                .compressed_handle = 0,
             };
         }
 
@@ -277,7 +260,6 @@ pub const PhysicalMemoryManager = struct {
                     self.setBit(@intCast(idx), true);
                     self.frame_table[idx].state = .active;
                     self.frame_table[idx].ref_count = 1;
-                    self.frame_table[idx].compressed_handle = 0;
                 }
                 self.free_frames -= count;
 
@@ -310,7 +292,6 @@ pub const PhysicalMemoryManager = struct {
                 self.free_frames += 1;
                 self.frame_table[frame_idx].state = .free;
                 self.frame_table[frame_idx].ref_count = 0;
-                self.frame_table[frame_idx].compressed_handle = 0;
             }
         }
     }
