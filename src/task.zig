@@ -245,7 +245,7 @@ pub const Scheduler = struct {
     pub fn findNextReadyTask(self: *Scheduler, from_task_id: TaskId) ?*Task {
         var start_idx: usize = 0;
         for (&self.tasks, 0..) |*t, i| {
-            if (t.id == from_task_id) {
+            if (t.state != .unused and t.id == from_task_id) {
                 start_idx = (i + 1) % MAX_TASKS;
                 break;
             }
