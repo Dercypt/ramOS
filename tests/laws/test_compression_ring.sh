@@ -55,6 +55,11 @@ if ! grep -q "triggerEviction" src/memory.zig; then
     exit 1
 fi
 
+if ! grep -q "triggerEviction(@max(self.watermark_high, count))" src/memory.zig; then
+    echo "ERROR: allocContiguousFrames must evict to @max(self.watermark_high, count) to prevent under-eviction."
+    exit 1
+fi
+
 if ! grep -q "compressing" src/memory.zig || ! grep -q "decompressing" src/memory.zig; then
     echo "ERROR: PageState in src/memory.zig must include compressing and decompressing states."
     exit 1
