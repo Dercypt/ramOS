@@ -478,13 +478,36 @@ test "task context structure layout and register offsets" {
     try std.testing.expectEqual(std.builtin.Type.ContainerLayout.@"extern", @typeInfo(TaskContext).Struct.layout);
 
     // Ensure TaskContext struct alignment and size are sound
-    try std.testing.expect(@sizeOf(TaskContext) >= 176);
+    try std.testing.expectEqual(@as(usize, 176), @sizeOf(TaskContext));
+    try std.testing.expectEqual(@as(usize, 8), @alignOf(TaskContext));
+
+    // General-purpose callee-saved registers
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(TaskContext, "x19"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(TaskContext, "x20"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(TaskContext, "x21"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(TaskContext, "x22"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(TaskContext, "x23"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(TaskContext, "x24"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(TaskContext, "x25"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(TaskContext, "x26"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(TaskContext, "x27"));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(TaskContext, "x28"));
     try std.testing.expectEqual(@as(usize, 80), @offsetOf(TaskContext, "x29"));
     try std.testing.expectEqual(@as(usize, 88), @offsetOf(TaskContext, "x30"));
+
+    // Stack pointer and argument
     try std.testing.expectEqual(@as(usize, 96), @offsetOf(TaskContext, "sp"));
     try std.testing.expectEqual(@as(usize, 104), @offsetOf(TaskContext, "arg"));
+
+    // SIMD / FP callee-saved registers (d8 - d15)
     try std.testing.expectEqual(@as(usize, 112), @offsetOf(TaskContext, "d8"));
+    try std.testing.expectEqual(@as(usize, 120), @offsetOf(TaskContext, "d9"));
+    try std.testing.expectEqual(@as(usize, 128), @offsetOf(TaskContext, "d10"));
+    try std.testing.expectEqual(@as(usize, 136), @offsetOf(TaskContext, "d11"));
+    try std.testing.expectEqual(@as(usize, 144), @offsetOf(TaskContext, "d12"));
+    try std.testing.expectEqual(@as(usize, 152), @offsetOf(TaskContext, "d13"));
+    try std.testing.expectEqual(@as(usize, 160), @offsetOf(TaskContext, "d14"));
+    try std.testing.expectEqual(@as(usize, 168), @offsetOf(TaskContext, "d15"));
 }
 
 test "scheduler initialization and primary task reservation" {
