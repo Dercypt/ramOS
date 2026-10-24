@@ -100,8 +100,8 @@ export fn _start() callconv(.C) noreturn {
     uartPrintU64(zstd.ZSTD_estimateCCtxSize(1) / 1024);
     uartPrint(" KiB static workspace\r\n");
     uartPrint("[ramOS] Zstd Static DCtx initialized: ");
-    uartPrintU64(zstd.ZSTD_estimateDCtxSize() / 1024);
-    uartPrint(" KiB static workspace\r\n");
+    uartPrintU64(zstd.ZSTD_estimateDCtxSize());
+    uartPrint(" bytes context\r\n");
 
     uartPrint("[ramOS] Running Zstandard Compression Engine self-tests...\r\n");
     testZstdCompression();
