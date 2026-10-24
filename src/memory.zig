@@ -227,9 +227,9 @@ pub const PhysicalMemoryManager = struct {
         if (count == 0) return null;
 
         // Synchronous eviction path: if memory is low or insufficient for allocation,
-        // compress cold pages until free frames meet or exceed the high watermark.
+        // compress cold pages until free frames meet or exceed the high watermark or requested count.
         if (!self.is_evicting and (self.free_frames <= self.watermark_low or self.free_frames < count)) {
-            _ = self.triggerEviction(self.watermark_high);
+            _ = self.triggerEviction(@max(self.watermark_high, count));
         }
 
         if (self.free_frames < count) return null;
