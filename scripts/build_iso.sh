@@ -44,6 +44,11 @@ if [ ! -f "$ROOT_DIR/QEMU_EFI.fd" ]; then
     done
 fi
 
+if [ ! -f "$ROOT_DIR/QEMU_EFI.fd" ]; then
+    echo "[*] Fetching QEMU AArch64 EFI firmware (QEMU_EFI.fd)..."
+    curl -sL "https://raw.githubusercontent.com/hoobaa/qemu-aarc64/master/QEMU_EFI.fd" -o "$ROOT_DIR/QEMU_EFI.fd" || true
+fi
+
 # 4. Populate ISO staging directory
 rm -rf "$ISO_STAGING"
 mkdir -p "$ISO_STAGING/EFI/BOOT"
@@ -68,6 +73,8 @@ if command -v xorriso >/dev/null 2>&1 && [ -f "$ISO_STAGING/limine-uefi-cd.bin" 
         -efi-boot-part --efi-boot-image --protective-msdos-label \
         "$ISO_STAGING" -o "$ISO_OUTPUT" 2>/dev/null
 elif command -v hdiutil >/dev/null 2>&1; then
+    echo "[!] Warning: xorriso not detected; falling back to hdiutil makehybrid."
+    echo "    Note: hdiutil does not write El Torito UEFI boot headers. Install xorriso ('brew install xorriso') for bootable ISOs."
     rm -f "$ISO_OUTPUT"
     hdiutil makehybrid -iso -joliet -o "$ISO_OUTPUT" "$ISO_STAGING" >/dev/null
 elif command -v genisoimage >/dev/null 2>&1; then
