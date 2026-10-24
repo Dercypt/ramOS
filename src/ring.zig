@@ -376,6 +376,7 @@ pub const CompressionRing = struct {
                     // Page is incompressible; eviction transitions it to active and skips it
                     continue;
                 }
+                _ = self.enqueue(entry);
                 return null;
             };
 
