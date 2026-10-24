@@ -474,6 +474,9 @@ pub fn taskEntryTrampoline() callconv(.C) void {
 // --------------------------------------------------------------------------
 
 test "task context structure layout and register offsets" {
+    // Ensure TaskContext is an extern struct with C-ABI guaranteed field ordering
+    try std.testing.expectEqual(std.builtin.Type.ContainerLayout.@"extern", @typeInfo(TaskContext).Struct.layout);
+
     // Ensure TaskContext struct alignment and size are sound
     try std.testing.expect(@sizeOf(TaskContext) >= 176);
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(TaskContext, "x19"));
