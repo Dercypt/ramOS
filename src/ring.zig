@@ -213,7 +213,7 @@ pub const ManagedPage = struct {
 /// Lockless in-RAM circular ring buffer orchestrating cold page compression
 /// and synchronous eviction when free physical frames breach the low watermark.
 pub const CompressionRing = struct {
-    slots: [*]RingSlot = undefined,
+    slots: []RingSlot = &[_]RingSlot{},
     capacity: usize = 0,
     mask: usize = 0,
     head: usize = 0,
@@ -260,7 +260,7 @@ pub const CompressionRing = struct {
 
         self.capacity = cap;
         self.mask = cap - 1;
-        self.slots = buffer.ptr;
+        self.slots = buffer;
         self.head = 0;
         self.tail = 0;
         self.count = 0;
@@ -1192,4 +1192,14 @@ test "allocContiguousFrames evicts cold pages up to count when count exceeds hig
     for (&cold_pages) |*cp| {
         cp.deallocate(&pmm, &slab_alloc);
     }
+}
+
+test "CompressionRing stores slots as bounded slice for software-enforced isolation" {
+    var ring = CompressionRing{};
+    var test_slots: [8]RingSlot = undefined;
+    ring.initWithBuffer(&test_slots);
+
+    try std.testing.expectEqual(@TypeOf(ring.slots), []RingSlot);
+    try std.testing.expectEqual(ring.capacity, ring.slots.len);
+    try std.testing.expectEqual(@as(usize, 8), ring.slots.len);
 }

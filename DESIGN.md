@@ -80,6 +80,7 @@ To prevent memory allocation deadlocks when memory is scarce, compression operat
 2. **Zero TLB Flushes:** Context switches save and restore only general-purpose registers (`x0-x30`, `sp`, `pc`) and SIMD registers. No `TLBI` (TLB Invalidate) instructions are executed.
 3. **Safety Layer:**
    - Without hardware MMU page permission bits between tasks, safety and memory bounds are strictly enforced by Zig's compile-time types, slice bounds checking, and `ReleaseSafe` panic traps.
+   - Core kernel tables (`PhysicalMemoryManager.bitmap: []u8`, `PhysicalMemoryManager.frame_table: []FrameMeta`, `CompressionRing.slots: []RingSlot`, and `PageHandleManager.entries: []HandleEntry`) are stored as bounded slices sliced once during initialization rather than unchecked multi-item pointers (`[*]T`), activating runtime bounds checking against silent buffer overruns.
    - Pointers across tasks are managed through capability-style handles or borrow-checked abstractions.
 4. **Task Scheduling & Slot Lifecycle:**
    - Tasks are scheduled via cooperative round-robin across a bounded task table.
