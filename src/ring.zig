@@ -1022,3 +1022,92 @@ test "eviction halts cleanly when slab pool is exhausted without zero-gain emerg
         slab_alloc.freeCompressed(dummy_handles[d]);
     }
 }
+
+test "eviction preserves cold page in ring on slab exhaustion without orphaning" {
+    const mock_ram_size: usize = 4 * 1024 * 1024; // 4 MiB = 1024 frames
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: slab.SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    const warmup = slab_alloc.allocCompressed("warmup") orelse return error.TestUnexpectedResult;
+    slab_alloc.freeCompressed(warmup);
+
+    var ring: CompressionRing = .{};
+    ring.init(&pmm, &slab_alloc);
+
+    // Deplete reserve blocks in slab_alloc
+    while (slab_alloc.popReserveBlock()) |_| {}
+
+    // Allocate frame for the cold test page before exhausting PMM
+    const p1 = pmm.allocFrame() orelse return error.TestUnexpectedResult;
+    const v1: [*]u8 = pmm.physToVirt(p1);
+    @memset(v1[0..memory.PAGE_SIZE], 'K');
+    var comp_page = ManagedPage.initActive(p1);
+    _ = comp_page.markCold(&pmm);
+    _ = ring.enqueueManagedPage(&comp_page);
+
+    // Drain PMM free frames below slab block allocation requirement
+    while (pmm.free_frames > 3) {
+        _ = pmm.allocFrame() orelse break;
+    }
+
+    // Exhaust all remaining slots across existing slab caches
+    var dummy_handles: [2500]slab.PageHandle = undefined;
+    var dummy_count: usize = 0;
+    for (&slab_alloc.caches, 0..) |*cache, c_idx| {
+        while (cache.alloc(&pmm)) |slot| {
+            if (slab_alloc.handle_mgr.allocHandle(slot, 16, @intCast(c_idx))) |h| {
+                dummy_handles[dummy_count] = h;
+                dummy_count += 1;
+            } else {
+                cache.free(&pmm, slot);
+                break;
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), ring.getCount());
+
+    // 1. evictOne must fail because slab pool cannot allocate, returning null
+    const fail_evict = ring.evictOne(&pmm, &slab_alloc);
+    try std.testing.expectEqual(@as(?RingEntry, null), fail_evict);
+
+    // 2. Cold page must NOT be orphaned: it must remain .cold and stay enqueued in the ring
+    try std.testing.expect(comp_page.isCold());
+    try std.testing.expectEqual(memory.PageState.cold, comp_page.state);
+    try std.testing.expectEqual(@as(usize, 1), ring.getCount());
+
+    // 3. Free dummy slab allocations to replenish slab capacity
+    while (dummy_count > 0) {
+        dummy_count -= 1;
+        slab_alloc.freeCompressed(dummy_handles[dummy_count]);
+    }
+
+    // 4. Subsequent eviction should now successfully evict the retained cold page
+    const ok_evict = ring.evictOne(&pmm, &slab_alloc);
+    try std.testing.expect(ok_evict != null);
+    try std.testing.expect(comp_page.isCompressed());
+    try std.testing.expectEqual(@as(usize, 0), ring.getCount());
+
+    // Clean up
+    comp_page.deallocate(&pmm, &slab_alloc);
+}
