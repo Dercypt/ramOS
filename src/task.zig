@@ -17,8 +17,15 @@ pub const TaskState = enum(u8) {
 };
 
 /// Saved register context for cooperative green threads on AArch64.
-/// Only general-purpose registers x19-x30 and SP are callee-saved across switches.
+/// Only general-purpose registers x19-x30, SP, and callee-saved SIMD d8-d15 are preserved across switches.
 /// Page tables and translation registers are untouched (Law of the Single Flat Space).
+///
+/// Declared as `extern struct` to guarantee deterministic C-ABI field ordering and layout matching
+/// the hardcoded byte offsets in `switchContext` and `loadContext` inline assembly routines:
+/// - x19..x30 (bytes 0..95)
+/// - sp (byte 96)
+/// - arg (byte 104)
+/// - d8..d15 (bytes 112..175)
 pub const TaskContext = extern struct {
     // Callee-saved general-purpose registers (offset 0 .. 95)
     x19: u64 = 0,
