@@ -222,7 +222,9 @@ pub const PhysicalMemoryManager = struct {
         return self.frame_table[frame_idx].state == .cold;
     }
 
-    /// Allocate contiguous physical frames with specified frame alignment (in frame units)
+    /// Allocate contiguous physical frames with specified frame alignment (in frame units).
+    /// If memory pressure breaches watermark_low or cannot satisfy count, triggers synchronous
+    /// eviction up to @max(watermark_high, count) to prevent multi-frame under-eviction starvation.
     pub fn allocContiguousFrames(self: *PhysicalMemoryManager, count: usize, alignment: usize) ?u64 {
         if (count == 0) return null;
 

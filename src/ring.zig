@@ -357,6 +357,8 @@ pub const CompressionRing = struct {
     /// Evict a single cold page: compresses via Zstd into the slab pool and frees
     /// the physical frame back to physical memory manager.
     /// Compression eviction is strictly restricted to ManagedPage instances.
+    /// If compression fails due to slab pool exhaustion (OutOfMemory), the cold page
+    /// entry is immediately re-enqueued into the ring to prevent orphaning.
     pub fn evictOne(
         self: *CompressionRing,
         pmm: *memory.PhysicalMemoryManager,
@@ -376,6 +378,7 @@ pub const CompressionRing = struct {
                     // Page is incompressible; eviction transitions it to active and skips it
                     continue;
                 }
+                // Slab exhaustion: preserve entry in ring to prevent orphaning cold page
                 _ = self.enqueue(entry);
                 return null;
             };
