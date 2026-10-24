@@ -366,6 +366,7 @@ pub const SlabAllocator = struct {
     caches: [NUM_SIZE_CLASSES]SlabCache = undefined,
     handle_mgr: PageHandleManager = .{},
     scratch_arena: ScratchArena = .{},
+    dctx_storage: [zstd.ZSTD_estimateDCtxSize()]u8 align(@alignOf(zstd.ZSTD_DCtx)) = undefined,
     cctx: ?*zstd.ZSTD_CCtx = null,
     dctx: ?*zstd.ZSTD_DCtx = null,
     initialized: bool = false,
@@ -427,17 +428,16 @@ pub const SlabAllocator = struct {
             @panic("Failed to allocate slab handle manager table");
         }
 
-        // Reserve 256 KiB fixed scratch arena for Zstandard working state
-        const SCRATCH_ARENA_SIZE: usize = 256 * 1024;
+        // Reserve 128 KiB fixed scratch arena for Zstandard compression working state
+        const SCRATCH_ARENA_SIZE: usize = zstd.ZSTD_estimateCCtxSize(1);
         if (!self.scratch_arena.init(pmm, SCRATCH_ARENA_SIZE)) {
             @panic("Failed to allocate Zstd fixed scratch arena");
         }
 
-        // Initialize pre-allocated Zstandard compression and decompression contexts in static scratch arena
+        // Initialize pre-allocated Zstandard compression context in scratch arena and decompression context in static storage
         const scratch_slice = self.scratch_arena.getSlice();
-        const half = scratch_slice.len / 2;
-        self.cctx = zstd.ZSTD_initStaticCCtx(scratch_slice[0..half]);
-        self.dctx = zstd.ZSTD_initStaticDCtx(scratch_slice[half..]);
+        self.cctx = zstd.ZSTD_initStaticCCtx(scratch_slice);
+        self.dctx = zstd.ZSTD_initStaticDCtx(&self.dctx_storage);
 
         if (self.cctx == null or self.dctx == null) {
             @panic("Failed to initialize static Zstd contexts");

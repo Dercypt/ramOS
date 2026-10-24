@@ -23,7 +23,7 @@ Limine maps all available physical memory to a higher-half virtual base (`HHDM_O
 
 - **Active Physical Frame Pool:** Backs active execution, stacks, task heaps, and kernel data structures.
 - **Compressed Slab Pool:** Houses cold pages compressed via Zstandard. Allocated in 64 KiB or 256 KiB slab blocks to minimize external fragmentation.
-- **Fixed Scratch Arena:** A pre-allocated, unpageable memory buffer reserved strictly for Zstandard compression/decompression working state to prevent OOM recursion during compression.
+- **Fixed Scratch Arena:** A pre-allocated, unpageable memory buffer (128 KiB) reserved strictly for Zstandard compression working state (`ZSTD_CCtx`) to prevent OOM recursion during compression. Decompression (`ZSTD_DCtx`) operates without workspace memory overhead, streaming directly into destination frames.
 
 ---
 
@@ -68,7 +68,7 @@ stateDiagram-v2
 
 To prevent memory allocation deadlocks when memory is scarce, compression operates via a lockless circular ring buffer with pre-allocated scratch memory:
 
-1. **Pre-allocated Zstd Context:** `ZSTD_CCtx` and `ZSTD_DCtx` structures are initialized at boot in reserved memory. No heap allocations occur inside the compression path. The encoder guarantees full input coverage (`src_pos == src.len`) and frame header accounting (`out_pos + total_block_bytes < src.len`), falling back to canonical single raw blocks on workspace exhaustion or frame expansion.
+1. **Pre-allocated Zstd Context:** `ZSTD_CCtx` (128 KiB scratch arena) and `ZSTD_DCtx` (lean struct without workspace overhead) structures are initialized at boot in reserved memory. No heap allocations occur inside the compression path. The encoder guarantees full input coverage (`src_pos == src.len`) and frame header accounting (`out_pos + total_block_bytes < src.len`), falling back to canonical single raw blocks on workspace exhaustion or frame expansion. Decompression decodes directly into destination frames using idiomatic Zig error unions.
 2. **Synchronous Eviction Path:** When available free physical frames drop below `WATERMARK_LOW` (e.g., 10% of physical RAM), any subsequent allocation call triggers synchronous compression of the oldest `Cold` pages until free frames exceed `WATERMARK_HIGH` (e.g., 20%).
 3. **Zero Disk I/O:** Eviction latency is purely the CPU throughput of Zstandard decompression/compression (~hundreds of MB/s to GB/s on modern AArch64 cores).
 
@@ -85,6 +85,7 @@ To prevent memory allocation deadlocks when memory is scarce, compression operat
    - Tasks are scheduled via cooperative round-robin across a bounded task table.
    - Round-robin search (`findNextReadyTask`) strictly inspects active/ready task slots (`state != .unused`) when locating the predecessor task index to prevent recycled or default-initialized unused slots from hijacking the search start index.
    - Terminated tasks defer stack deallocation to `reclaimZombie` executed on the next scheduled task context, recycling the slot to `.unused` without leaking task slots.
+   - To eliminate kernel `.bss` bloating, `Scheduler` gates mock test stacks (`static_stacks: [MAX_TASKS][16 KiB]u8`, 1 MiB) behind `builtin.is_test`, allocating only a single 16 KiB `idle_stack` for freestanding kernel context switching.
 
 ---
 

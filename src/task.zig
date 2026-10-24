@@ -99,8 +99,10 @@ pub const Scheduler = struct {
     pmm: ?*memory.PhysicalMemoryManager = null,
     slab_alloc: ?*memory.slab.SlabAllocator = null,
 
-    // Static stacks for mock/host testing if needed
-    static_stacks: [MAX_TASKS][DEFAULT_STACK_SIZE]u8 align(16) = undefined,
+    // Static stacks for mock/host testing if needed (1 MiB in test mode).
+    // On freestanding/kernel targets, only a single idle stack (16 KiB) is retained to avoid bloating .bss.
+    static_stacks: (if (builtin.is_test) [MAX_TASKS][DEFAULT_STACK_SIZE]u8 else void) align(16) = undefined,
+    idle_stack: (if (builtin.is_test) void else [DEFAULT_STACK_SIZE]u8) align(16) = undefined,
 
     pub fn init(self: *Scheduler) void {
         self.current_task_id = null;
@@ -212,40 +214,44 @@ pub const Scheduler = struct {
         arg: u64,
         name: []const u8,
     ) ?TaskId {
-        var slot_idx: ?usize = null;
-        for (&self.tasks, 0..) |*t, idx| {
-            if (t.state == .unused) {
-                slot_idx = idx;
-                break;
+        if (comptime !builtin.is_test) {
+            return null;
+        } else {
+            var slot_idx: ?usize = null;
+            for (&self.tasks, 0..) |*t, idx| {
+                if (t.state == .unused) {
+                    slot_idx = idx;
+                    break;
+                }
             }
+            const idx = slot_idx orelse return null;
+
+            const task_id = self.next_task_id;
+            self.next_task_id += 1;
+
+            const stack_top = @as(usize, @intFromPtr(&self.static_stacks[idx][0])) + DEFAULT_STACK_SIZE;
+
+            var task = &self.tasks[idx];
+            task.* = .{
+                .id = task_id,
+                .state = .ready,
+                .stack_base_phys = 0,
+                .stack_size = DEFAULT_STACK_SIZE,
+                .entry = entry,
+                .arg = arg,
+                .yield_count = 0,
+                .stack_page_count = 0,
+            };
+            task.setName(name);
+
+            task.context = .{};
+            task.context.sp = @as(u64, @intCast(stack_top & ~@as(usize, 15)));
+            task.context.x30 = @as(u64, @intFromPtr(&taskEntryTrampoline));
+            task.context.arg = arg;
+
+            self.task_count += 1;
+            return task_id;
         }
-        const idx = slot_idx orelse return null;
-
-        const task_id = self.next_task_id;
-        self.next_task_id += 1;
-
-        const stack_top = @as(usize, @intFromPtr(&self.static_stacks[idx][0])) + DEFAULT_STACK_SIZE;
-
-        var task = &self.tasks[idx];
-        task.* = .{
-            .id = task_id,
-            .state = .ready,
-            .stack_base_phys = 0,
-            .stack_size = DEFAULT_STACK_SIZE,
-            .entry = entry,
-            .arg = arg,
-            .yield_count = 0,
-            .stack_page_count = 0,
-        };
-        task.setName(name);
-
-        task.context = .{};
-        task.context.sp = @as(u64, @intCast(stack_top & ~@as(usize, 15)));
-        task.context.x30 = @as(u64, @intFromPtr(&taskEntryTrampoline));
-        task.context.arg = arg;
-
-        self.task_count += 1;
-        return task_id;
     }
 
     /// Find the next ready task in round-robin order starting after the specified task ID.
@@ -368,7 +374,10 @@ pub const Scheduler = struct {
             }
 
             // Idle loop: switch away from terminating task stack before reclaiming zombie stack
-            const idle_sp = @as(usize, @intFromPtr(&self.static_stacks[0][0])) + DEFAULT_STACK_SIZE;
+            const idle_sp = if (builtin.is_test)
+                @as(usize, @intFromPtr(&self.static_stacks[0][0])) + DEFAULT_STACK_SIZE
+            else
+                @as(usize, @intFromPtr(&self.idle_stack[0])) + DEFAULT_STACK_SIZE;
             if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .freestanding) {
                 asm volatile (
                     \\ mov sp, %[sp]
@@ -801,4 +810,11 @@ test "findNextReadyTask skips unused task slots with matching id" {
     const next_from_0 = sched.findNextReadyTask(0);
     try std.testing.expect(next_from_0 != null);
     try std.testing.expectEqual(@as(TaskId, 42), next_from_0.?.id);
+}
+
+test "Scheduler: static stacks gated for test builds and idle stack for freestanding" {
+    if (builtin.is_test) {
+        try std.testing.expect(@sizeOf(@TypeOf(global_scheduler.static_stacks)) == MAX_TASKS * DEFAULT_STACK_SIZE);
+        try std.testing.expect(@sizeOf(@TypeOf(global_scheduler.idle_stack)) == 0);
+    }
 }
