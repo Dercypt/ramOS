@@ -56,7 +56,7 @@ pub const PhysicalMemoryManager = struct {
     is_evicting: bool = false,
 
     // Bitmap for 4 KiB frame allocation
-    bitmap: [*]u8 = undefined,
+    bitmap: []u8 = &[_]u8{},
     bitmap_size_bytes: usize = 0,
 
     // Frame metadata array
@@ -129,9 +129,10 @@ pub const PhysicalMemoryManager = struct {
         }
 
         // Initialize bitmap in the HHDM address space
-        self.bitmap = self.physToVirt(reserved_phys);
+        const bitmap_ptr: [*]u8 = self.physToVirt(reserved_phys);
+        self.bitmap = bitmap_ptr[0..self.bitmap_size_bytes];
         // Initially mark all frames as allocated/busy (1 = busy/unavailable)
-        @memset(self.bitmap[0..self.bitmap_size_bytes], 0xFF);
+        @memset(self.bitmap, 0xFF);
 
         // Frame table is placed immediately after the bitmap
         const frame_table_phys = reserved_phys + (bitmap_frames_needed * PAGE_SIZE);
@@ -173,7 +174,7 @@ pub const PhysicalMemoryManager = struct {
     }
 
     fn setBit(self: *PhysicalMemoryManager, frame_idx: u64, occupied: bool) void {
-        const byte_idx = frame_idx / 8;
+        const byte_idx: usize = @intCast(frame_idx / 8);
         const bit_idx: u3 = @intCast(frame_idx % 8);
         const mask = @as(u8, 1) << bit_idx;
 
@@ -185,7 +186,7 @@ pub const PhysicalMemoryManager = struct {
     }
 
     fn isBitSet(self: *const PhysicalMemoryManager, frame_idx: u64) bool {
-        const byte_idx = frame_idx / 8;
+        const byte_idx: usize = @intCast(frame_idx / 8);
         const bit_idx: u3 = @intCast(frame_idx % 8);
         return (self.bitmap[byte_idx] & (@as(u8, 1) << bit_idx)) != 0;
     }
@@ -440,4 +441,31 @@ test "allocContiguousFrames evicts to max of watermark_high and requested frame 
     // Initial eviction before allocation must target @max(watermark_high, count) == 10
     try std.testing.expect(EvictState.target_count >= 1);
     try std.testing.expectEqual(@as(usize, 10), EvictState.targets[0]);
+}
+
+test "PhysicalMemoryManager stores bitmap as bounded slice for software-enforced isolation" {
+    const mock_ram_size: usize = 128 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: PhysicalMemoryManager = .{};
+
+    var usable_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    usable_entry.base = 0;
+    usable_entry.length = mock_ram_size;
+    usable_entry.type = .usable;
+
+    var entries = [_]*limine.MemoryMapEntry{&usable_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entries,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    try std.testing.expectEqual(@TypeOf(pmm.bitmap), []u8);
+    try std.testing.expectEqual(pmm.bitmap_size_bytes, pmm.bitmap.len);
+    try std.testing.expect(pmm.bitmap.len > 0);
 }
