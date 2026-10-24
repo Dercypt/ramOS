@@ -64,6 +64,16 @@ pub const ManagedPage = struct {
         return true;
     }
 
+    /// Mark this cold page as active again (e.g. when task is scheduled to run)
+    pub fn markActive(self: *ManagedPage, pmm: ?*memory.PhysicalMemoryManager) bool {
+        if (self.state != .cold) return false;
+        self.state = .active;
+        if (pmm) |p| {
+            _ = p.markActive(self.phys_addr);
+        }
+        return true;
+    }
+
     pub fn isCold(self: *const ManagedPage) bool {
         return self.state == .cold;
     }
@@ -528,10 +538,18 @@ test "managed page lifecycle transitions and compression roundtrip" {
     @memcpy(virt[3000..3020], "Phase 4 Ring Test!!!");
     @memset(virt[3020..4096], 'Z');
 
-    // 2. Mark cold
+    // 2. Mark cold and reactivate with markActive
     try std.testing.expect(page.markCold(&pmm));
     try std.testing.expect(page.isCold());
     try std.testing.expectEqual(memory.PageState.cold, page.state);
+
+    try std.testing.expect(page.markActive(&pmm));
+    try std.testing.expect(page.isActive());
+    try std.testing.expectEqual(memory.PageState.active, page.state);
+
+    // Re-mark cold for subsequent compression test
+    try std.testing.expect(page.markCold(&pmm));
+    try std.testing.expect(page.isCold());
 
     // 3. Compress into slab pool
     const initial_free = pmm.free_frames;
