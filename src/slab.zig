@@ -260,7 +260,7 @@ pub const HandleEntry = struct {
 
 /// Table managing handles to compressed pages in the in-RAM slab pool
 pub const PageHandleManager = struct {
-    entries: [*]HandleEntry = undefined,
+    entries: []HandleEntry = &[_]HandleEntry{},
     max_handles: usize = 0,
     free_head: u32 = 0,
     active_handles: usize = 0,
@@ -273,7 +273,8 @@ pub const PageHandleManager = struct {
 
         const phys = pmm.allocContiguousFrames(frames_needed, 1) orelse return false;
         self.phys_addr = phys;
-        self.entries = @ptrCast(@alignCast(pmm.physToVirt(phys)));
+        const entries_ptr: [*]HandleEntry = @ptrCast(@alignCast(pmm.physToVirt(phys)));
+        self.entries = entries_ptr[0..max_handles];
         self.active_handles = 0;
 
         var i: u32 = 1;
@@ -843,4 +844,38 @@ test "allocCompressed reclaims allocated slab slot when handle table is exhauste
     try std.testing.expectEqual(@as(?PageHandle, null), result);
     // Ensure the slot allocated in slab_alloc.caches was freed back and not leaked
     try std.testing.expectEqual(initial_active, slab_alloc.caches[class_idx].active_allocations);
+}
+
+test "PageHandleManager stores entries as bounded slice for software-enforced isolation" {
+    const std = @import("std");
+    const limine = @import("limine.zig");
+    const mock_ram_size: usize = 2 * 1024 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var handle_mgr: PageHandleManager = .{};
+    const max_handles: usize = 64;
+    const ok = handle_mgr.init(&pmm, max_handles);
+    try std.testing.expect(ok);
+
+    try std.testing.expectEqual(@TypeOf(handle_mgr.entries), []HandleEntry);
+    try std.testing.expectEqual(max_handles, handle_mgr.entries.len);
+    try std.testing.expect(handle_mgr.entries.len > 0);
 }
