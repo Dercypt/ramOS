@@ -60,7 +60,7 @@ pub const PhysicalMemoryManager = struct {
     bitmap_size_bytes: usize = 0,
 
     // Frame metadata array
-    frame_table: [*]FrameMeta = undefined,
+    frame_table: []FrameMeta = &[_]FrameMeta{},
     max_phys_addr: u64 = 0,
 
     pub fn physToVirt(self: *const PhysicalMemoryManager, phys: u64) [*]u8 {
@@ -136,7 +136,8 @@ pub const PhysicalMemoryManager = struct {
 
         // Frame table is placed immediately after the bitmap
         const frame_table_phys = reserved_phys + (bitmap_frames_needed * PAGE_SIZE);
-        self.frame_table = @ptrCast(@alignCast(self.physToVirt(frame_table_phys)));
+        const frame_table_ptr: [*]FrameMeta = @ptrCast(@alignCast(self.physToVirt(frame_table_phys)));
+        self.frame_table = frame_table_ptr[0..self.max_frames];
 
         // Initialize ALL frame table slots to reserved state before unmasking usable frames
         var f: usize = 0;
@@ -468,4 +469,31 @@ test "PhysicalMemoryManager stores bitmap as bounded slice for software-enforced
     try std.testing.expectEqual(@TypeOf(pmm.bitmap), []u8);
     try std.testing.expectEqual(pmm.bitmap_size_bytes, pmm.bitmap.len);
     try std.testing.expect(pmm.bitmap.len > 0);
+}
+
+test "PhysicalMemoryManager stores frame_table as bounded slice for software-enforced isolation" {
+    const mock_ram_size: usize = 128 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: PhysicalMemoryManager = .{};
+
+    var usable_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    usable_entry.base = 0;
+    usable_entry.length = mock_ram_size;
+    usable_entry.type = .usable;
+
+    var entries = [_]*limine.MemoryMapEntry{&usable_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entries,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    try std.testing.expectEqual(@TypeOf(pmm.frame_table), []FrameMeta);
+    try std.testing.expectEqual(pmm.max_frames, pmm.frame_table.len);
+    try std.testing.expect(pmm.frame_table.len > 0);
 }
