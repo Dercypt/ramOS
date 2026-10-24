@@ -30,6 +30,11 @@ if ! grep -q "ManagedPage" src/ring.zig; then
     exit 1
 fi
 
+if ! grep -q "markActive" src/ring.zig; then
+    echo "ERROR: markActive must be implemented on ManagedPage to reactivate cold pages upon task scheduling."
+    exit 1
+fi
+
 if ! grep -q "CompressionRing" src/ring.zig; then
     echo "ERROR: CompressionRing must be implemented in src/ring.zig."
     exit 1

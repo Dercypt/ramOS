@@ -219,6 +219,19 @@ pub const PhysicalMemoryManager = struct {
         return self.markFrameCold(phys / PAGE_SIZE);
     }
 
+    pub fn markFrameActive(self: *PhysicalMemoryManager, frame_idx: usize) bool {
+        if (frame_idx >= self.max_frames) return false;
+        if (self.frame_table[frame_idx].state == .cold) {
+            self.frame_table[frame_idx].state = .active;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn markActive(self: *PhysicalMemoryManager, phys: u64) bool {
+        return self.markFrameActive(phys / PAGE_SIZE);
+    }
+
     pub fn isCold(self: *const PhysicalMemoryManager, frame_idx: usize) bool {
         if (frame_idx >= self.max_frames) return false;
         return self.frame_table[frame_idx].state == .cold;
@@ -496,4 +509,42 @@ test "PhysicalMemoryManager stores frame_table as bounded slice for software-enf
     try std.testing.expectEqual(@TypeOf(pmm.frame_table), []FrameMeta);
     try std.testing.expectEqual(pmm.max_frames, pmm.frame_table.len);
     try std.testing.expect(pmm.frame_table.len > 0);
+}
+
+test "PhysicalMemoryManager markCold and markActive state transitions" {
+    const mock_ram_size: usize = 128 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: PhysicalMemoryManager = .{};
+
+    var usable_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    usable_entry.base = 0;
+    usable_entry.length = mock_ram_size;
+    usable_entry.type = .usable;
+
+    var entries = [_]*limine.MemoryMapEntry{&usable_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entries,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    const frame_phys = pmm.allocFrame() orelse return error.OutOfMemory;
+    const frame_idx = frame_phys / PAGE_SIZE;
+
+    try std.testing.expectEqual(PageState.active, pmm.frame_table[frame_idx].state);
+
+    // Transition active -> cold
+    try std.testing.expect(pmm.markCold(frame_phys));
+    try std.testing.expectEqual(PageState.cold, pmm.frame_table[frame_idx].state);
+    try std.testing.expect(pmm.isCold(frame_idx));
+
+    // Transition cold -> active
+    try std.testing.expect(pmm.markActive(frame_phys));
+    try std.testing.expectEqual(PageState.active, pmm.frame_table[frame_idx].state);
+    try std.testing.expect(!pmm.isCold(frame_idx));
 }

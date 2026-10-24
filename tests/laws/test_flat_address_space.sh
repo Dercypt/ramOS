@@ -42,6 +42,16 @@ if ! grep -q "taskEntryTrampoline" src/task.zig; then
     exit 1
 fi
 
+if ! grep -q "enqueueColdTaskStacks" src/task.zig; then
+    echo "ERROR: Scheduler must implement enqueueColdTaskStacks to connect task switching to the eviction loop."
+    exit 1
+fi
+
+if ! grep -q "reactivateTaskStack" src/task.zig; then
+    echo "ERROR: Scheduler must implement reactivateTaskStack to prevent active stack eviction."
+    exit 1
+fi
+
 if command -v zig >/dev/null 2>&1; then
     zig test src/task.zig
 fi
