@@ -19,7 +19,7 @@ pub const TaskState = enum(u8) {
 /// Saved register context for cooperative green threads on AArch64.
 /// Only general-purpose registers x19-x30 and SP are callee-saved across switches.
 /// Page tables and translation registers are untouched (Law of the Single Flat Space).
-pub const TaskContext = struct {
+pub const TaskContext = extern struct {
     // Callee-saved general-purpose registers (offset 0 .. 95)
     x19: u64 = 0,
     x20: u64 = 0,
