@@ -22,8 +22,8 @@ if [ ! -f "src/task.zig" ]; then
     exit 1
 fi
 
-if ! grep -q "TaskContext" src/task.zig; then
-    echo "ERROR: TaskContext register save/restore structure must be defined in src/task.zig."
+if ! grep -Eq "pub const TaskContext = extern struct" src/task.zig; then
+    echo "ERROR: TaskContext must be declared as 'extern struct' in src/task.zig to guarantee predictable C-ABI layout for inline assembly context switching."
     exit 1
 fi
 
