@@ -67,12 +67,6 @@ pub const ZstdError = error{
     EndOfStream,
 };
 
-pub fn ZSTD_isError(code: anytype) bool {
-    const T = @TypeOf(code);
-    if (T == ZstdError or T == anyerror) return true;
-    return false;
-}
-
 pub fn ZSTD_getErrorName(err: anyerror) []const u8 {
     return @errorName(err);
 }
