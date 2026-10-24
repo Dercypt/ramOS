@@ -863,3 +863,218 @@ test "Scheduler: static stacks gated for test builds and idle stack for freestan
         try std.testing.expect(@sizeOf(@TypeOf(global_scheduler.idle_stack)) == 0);
     }
 }
+
+test "Scheduler.yield enqueues non-running task stack pages into global_ring" {
+    const limine = @import("limine.zig");
+    const mock_ram_size: usize = 4 * 1024 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+    pmm.init(base_addr, &mock_mmap);
+
+    // Initialize global_ring with a test slot buffer
+    var ring_slots: [32]ring.RingSlot = undefined;
+    ring.global_ring.initWithBuffer(&ring_slots);
+    defer ring.global_ring.initialized = false;
+
+    var sched: Scheduler = .{};
+    sched.init();
+
+    const dummyEntry = struct {
+        fn run(arg: u64) void {
+            _ = arg;
+        }
+    }.run;
+
+    const t1 = sched.spawn(&pmm, dummyEntry, 10, "worker_1") orelse return error.TestUnexpectedResult;
+    const t2 = sched.spawn(&pmm, dummyEntry, 20, "worker_2") orelse return error.TestUnexpectedResult;
+
+    const task1 = sched.getTaskById(t1).?;
+    const task2 = sched.getTaskById(t2).?;
+
+    // Initially, both spawned tasks are ready with active stack pages
+    try std.testing.expect(task1.managed_stack_pages[0].isActive());
+    try std.testing.expect(task2.managed_stack_pages[0].isActive());
+    try std.testing.expectEqual(@as(usize, 0), ring.global_ring.getCount());
+
+    // Yield from task 0 (kernel_main) -> task 1 becomes running, task 2 remains ready
+    sched.yield();
+    try std.testing.expectEqual(@as(?TaskId, t1), sched.current_task_id);
+    try std.testing.expect(task1.managed_stack_pages[0].isActive());
+
+    // Task 2 was non-running, so its stack pages should be marked cold and enqueued into global_ring
+    try std.testing.expect(task2.managed_stack_pages[0].isCold());
+    try std.testing.expectEqual(STACK_PAGE_COUNT, ring.global_ring.getCount());
+
+    // Yield from task 1 -> task 2 becomes running, task 1 becomes ready
+    sched.yield();
+    try std.testing.expectEqual(@as(?TaskId, t2), sched.current_task_id);
+
+    // Task 2's stack pages must be reactivated upon being scheduled
+    try std.testing.expect(task2.managed_stack_pages[0].isActive());
+
+    // Task 1 was yielding (now ready), so its stack pages must be marked cold and enqueued
+    try std.testing.expect(task1.managed_stack_pages[0].isCold());
+    // global_ring now contains task 2's old enqueued pages + task 1's newly enqueued pages
+    try std.testing.expectEqual(STACK_PAGE_COUNT * 2, ring.global_ring.getCount());
+}
+
+test "Live eviction loop compresses cold task stack pages when watermark breached" {
+    const limine = @import("limine.zig");
+    const mock_ram_size: usize = 4 * 1024 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: memory.slab.SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    // Warm up slab allocator cache
+    const warmup = slab_alloc.allocCompressed("warmup") orelse return error.TestUnexpectedResult;
+    slab_alloc.freeCompressed(warmup);
+
+    var ring_slots: [32]ring.RingSlot = undefined;
+    ring.global_ring.initWithBuffer(&ring_slots);
+    defer ring.global_ring.initialized = false;
+
+    const EvictContext = struct {
+        var p_ring: *ring.CompressionRing = undefined;
+        var p_slab: *memory.slab.SlabAllocator = undefined;
+        fn callback(p: *memory.PhysicalMemoryManager, target_free: usize) usize {
+            return p_ring.evictUntil(p, p_slab, target_free);
+        }
+    };
+    EvictContext.p_ring = &ring.global_ring;
+    EvictContext.p_slab = &slab_alloc;
+    pmm.setEvictor(EvictContext.callback);
+
+    var sched: Scheduler = .{};
+    sched.init();
+
+    const dummyEntry = struct {
+        fn run(arg: u64) void {
+            _ = arg;
+        }
+    }.run;
+
+    const t1 = sched.spawn(&pmm, dummyEntry, 10, "worker_1") orelse return error.TestUnexpectedResult;
+    const t2 = sched.spawn(&pmm, dummyEntry, 20, "worker_2") orelse return error.TestUnexpectedResult;
+    _ = t2;
+
+    // Fill worker_1's stack frames with compressible data pattern
+    const task1 = sched.getTaskById(t1).?;
+    for (task1.managed_stack_pages[0..task1.stack_page_count]) |mp| {
+        const virt: [*]u8 = pmm.physToVirt(mp.phys_addr);
+        @memset(virt[0..memory.PAGE_SIZE], 'S');
+    }
+
+    // Switch to task 1
+    sched.yield();
+    // Switch to task 2; task 1 stack pages become cold and are enqueued to global_ring
+    sched.yield();
+    try std.testing.expect(task1.managed_stack_pages[0].isCold());
+    try std.testing.expect(ring.global_ring.getCount() > 0);
+
+    const initial_evicted = ring.global_ring.total_evicted;
+
+    // Simulate memory pressure breaching watermark_low
+    pmm.watermark_low = pmm.free_frames;
+    pmm.watermark_high = pmm.free_frames + 2;
+
+    // Allocation should trigger eviction of cold task 1 stack pages via global_ring
+    const frame = pmm.allocContiguousFrames(2, 1);
+    try std.testing.expect(frame != null);
+
+    // Eviction loop successfully evicted cold pages into the slab pool
+    try std.testing.expect(ring.global_ring.total_evicted > initial_evicted);
+    pmm.freeContiguousFrames(frame.?, 2);
+}
+
+test "Scheduler.yield handles uninitialized or full compression ring gracefully" {
+    const limine = @import("limine.zig");
+    const mock_ram_size: usize = 2 * 1024 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+    pmm.init(base_addr, &mock_mmap);
+
+    // 1. Uninitialized global_ring: yield does not panic and stack pages remain active
+    ring.global_ring.initialized = false;
+
+    var sched: Scheduler = .{};
+    sched.init();
+
+    const dummyEntry = struct {
+        fn run(arg: u64) void {
+            _ = arg;
+        }
+    }.run;
+
+    const t1 = sched.spawn(&pmm, dummyEntry, 10, "worker_1") orelse return error.TestUnexpectedResult;
+    const t2 = sched.spawn(&pmm, dummyEntry, 20, "worker_2") orelse return error.TestUnexpectedResult;
+    _ = t2;
+
+    sched.yield();
+    sched.yield();
+
+    const task1 = sched.getTaskById(t1).?;
+    try std.testing.expect(task1.managed_stack_pages[0].isActive());
+
+    // 2. Full ring capacity: pages that fail to enqueue revert to active
+    var tiny_slots: [2]ring.RingSlot = undefined;
+    ring.global_ring.initWithBuffer(&tiny_slots);
+    defer ring.global_ring.initialized = false;
+
+    // Fill the ring to capacity (2 slots)
+    var dummy_page = ring.ManagedPage.initActive(100 * memory.PAGE_SIZE);
+    _ = dummy_page.markCold(&pmm);
+    _ = ring.global_ring.enqueueManagedPage(&dummy_page);
+    var dummy_page2 = ring.ManagedPage.initActive(101 * memory.PAGE_SIZE);
+    _ = dummy_page2.markCold(&pmm);
+    _ = ring.global_ring.enqueueManagedPage(&dummy_page2);
+    try std.testing.expect(ring.global_ring.isFull());
+
+    // Yielding when ring is full does not corrupt page state or panic
+    sched.yield();
+    try std.testing.expect(task1.managed_stack_pages[0].isActive());
+}
