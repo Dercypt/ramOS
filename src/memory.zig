@@ -364,3 +364,78 @@ test "discontiguous physical RAM initializes total_frames and watermarks accurat
     pmm.freeFrame(phys);
     try std.testing.expectEqual(PageState.free, pmm.frame_table[phys / PAGE_SIZE].state);
 }
+
+test "allocContiguousFrames evicts to max of watermark_high and requested frame count" {
+    const mock_ram_size: usize = 512 * 1024; // 128 frames
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entries = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entries,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    const EvictState = struct {
+        var targets: [8]usize = undefined;
+        var target_count: usize = 0;
+
+        fn mockEvict(p: *PhysicalMemoryManager, target: usize) usize {
+            if (target_count < targets.len) {
+                targets[target_count] = target;
+                target_count += 1;
+            }
+            var freed: usize = 0;
+            var idx: usize = 0;
+            while (p.free_frames < target and idx < p.max_frames) : (idx += 1) {
+                if (p.isBitSet(@intCast(idx)) and p.frame_table[idx].state == .cold) {
+                    p.freeFrame(@as(u64, @intCast(idx)) * PAGE_SIZE);
+                    freed += 1;
+                }
+            }
+            return freed;
+        }
+    };
+
+    pmm.setEvictor(EvictState.mockEvict);
+
+    pmm.watermark_low = 2;
+    pmm.watermark_high = 5;
+
+    // Allocate all usable frames
+    while (pmm.allocFrame()) |_| {}
+    try std.testing.expectEqual(@as(usize, 0), pmm.free_frames);
+
+    // Free 6 contiguous frames: frames 10..15
+    const free_start = 10 * PAGE_SIZE;
+    pmm.freeContiguousFrames(free_start, 6);
+    try std.testing.expectEqual(@as(usize, 6), pmm.free_frames);
+
+    // Mark adjacent 4 frames (frames 16..19) as cold
+    var c: usize = 0;
+    while (c < 4) : (c += 1) {
+        pmm.frame_table[16 + c].state = .cold;
+    }
+
+    // watermark_high (5) <= free_frames (6) < count (10)
+    const count: usize = 10;
+    EvictState.target_count = 0;
+
+    const alloc_result = pmm.allocContiguousFrames(count, 1);
+    try std.testing.expect(alloc_result != null);
+    try std.testing.expectEqual(@as(u64, @intCast(free_start)), alloc_result.?);
+    // Initial eviction before allocation must target @max(watermark_high, count) == 10
+    try std.testing.expect(EvictState.target_count >= 1);
+    try std.testing.expectEqual(@as(usize, 10), EvictState.targets[0]);
+}

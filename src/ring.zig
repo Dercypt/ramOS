@@ -1111,3 +1111,82 @@ test "eviction preserves cold page in ring on slab exhaustion without orphaning"
     // Clean up
     comp_page.deallocate(&pmm, &slab_alloc);
 }
+
+test "allocContiguousFrames evicts cold pages up to count when count exceeds high watermark" {
+    const mock_ram_size: usize = 4 * 1024 * 1024; // 4 MiB = 1024 frames
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: slab.SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    const warmup = slab_alloc.allocCompressed("warmup") orelse return error.TestUnexpectedResult;
+    slab_alloc.freeCompressed(warmup);
+
+    const Context = struct {
+        var test_ring: CompressionRing = .{};
+        var test_slab: *slab.SlabAllocator = undefined;
+
+        fn evict(p: *memory.PhysicalMemoryManager, target: usize) usize {
+            return test_ring.evictUntil(p, test_slab, target);
+        }
+    };
+
+    Context.test_ring.initWithBuffer(Context.test_ring.static_slots[0..]);
+    Context.test_slab = &slab_alloc;
+    pmm.setEvictor(Context.evict);
+
+    // Inhibit eviction during test setup and memory draining
+    pmm.is_evicting = true;
+
+    // Allocate 10 contiguous frames and mark them cold
+    var cold_pages: [10]ManagedPage = undefined;
+    for (&cold_pages) |*cp| {
+        const p = pmm.allocFrame() orelse return error.TestUnexpectedResult;
+        const v: [*]u8 = pmm.physToVirt(p);
+        @memset(v[0..memory.PAGE_SIZE], 'M');
+        cp.* = ManagedPage.initActive(p);
+        _ = cp.markCold(&pmm);
+        _ = Context.test_ring.enqueueManagedPage(cp);
+    }
+
+    // Drain all remaining free frames
+    while (pmm.allocFrame()) |_| {}
+    try std.testing.expectEqual(@as(usize, 0), pmm.free_frames);
+
+    // Re-enable eviction for the test
+    pmm.is_evicting = false;
+
+    // watermark_low (2), watermark_high (3), count (6)
+    // Target eviction must be @max(watermark_high, count) == 6
+    // Before fix: triggerEviction(3) only freed 3 frames, failing count (6)
+    // With fix: triggerEviction(6) frees 6 contiguous cold frames
+    pmm.watermark_low = 2;
+    pmm.watermark_high = 3;
+
+    const count: usize = 6;
+    const contiguous_block = pmm.allocContiguousFrames(count, 1);
+    try std.testing.expect(contiguous_block != null);
+
+    pmm.freeContiguousFrames(contiguous_block.?, count);
+    for (&cold_pages) |*cp| {
+        cp.deallocate(&pmm, &slab_alloc);
+    }
+}
