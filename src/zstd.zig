@@ -83,7 +83,7 @@ pub fn ZSTD_estimateCCtxSize(compression_level: i32) usize {
 }
 
 pub fn ZSTD_estimateDCtxSize() usize {
-    return 128 * 1024; // 128 KiB static workspace
+    return @sizeOf(ZSTD_DCtx);
 }
 
 const Chunk = struct {
@@ -309,20 +309,17 @@ pub const ZSTD_CCtx = struct {
     }
 };
 
-/// Decompression context operating strictly within pre-allocated static workspace memory
+/// Decompression context operating with zero dynamic allocations
 pub const ZSTD_DCtx = struct {
-    workspace: []u8,
     total_decompressed: usize = 0,
 
     pub fn init(workspace: []u8) !*ZSTD_DCtx {
-        if (workspace.len < @sizeOf(ZSTD_DCtx) + 1024) {
+        if (workspace.len < @sizeOf(ZSTD_DCtx)) {
             return error.WorkspaceTooSmall;
         }
 
         const ctx: *ZSTD_DCtx = @ptrCast(@alignCast(workspace.ptr));
-        const remaining = workspace[@sizeOf(ZSTD_DCtx)..];
         ctx.* = .{
-            .workspace = remaining,
             .total_decompressed = 0,
         };
         return ctx;
@@ -387,21 +384,21 @@ test "zstd static context initialization and estimation" {
     const cctx_est = ZSTD_estimateCCtxSize(1);
     const dctx_est = ZSTD_estimateDCtxSize();
     try std.testing.expect(cctx_est > 0);
-    try std.testing.expect(dctx_est > 0);
+    try std.testing.expectEqual(@sizeOf(ZSTD_DCtx), dctx_est);
 
     var c_ws: [128 * 1024]u8 = undefined;
-    var d_ws: [128 * 1024]u8 = undefined;
+    var d_ws: [ZSTD_estimateDCtxSize()]u8 align(@alignOf(ZSTD_DCtx)) = undefined;
 
     const cctx = ZSTD_initStaticCCtx(&c_ws) orelse return error.TestUnexpectedResult;
     const dctx = ZSTD_initStaticDCtx(&d_ws) orelse return error.TestUnexpectedResult;
 
     try std.testing.expect(cctx.workspace.len > 0);
-    try std.testing.expect(dctx.workspace.len > 0);
+    try std.testing.expect(dctx.total_decompressed == 0);
 }
 
 test "zstd compression and decompression roundtrip" {
     var c_ws: [128 * 1024]u8 = undefined;
-    var d_ws: [128 * 1024]u8 = undefined;
+    var d_ws: [ZSTD_estimateDCtxSize()]u8 align(@alignOf(ZSTD_DCtx)) = undefined;
 
     const cctx = ZSTD_initStaticCCtx(&c_ws).?;
     const dctx = ZSTD_initStaticDCtx(&d_ws).?;
@@ -475,7 +472,7 @@ test "zstd compression and decompression roundtrip" {
 test "zstd chunk buffer exhaustion falls back to raw block and avoids silent truncation" {
     // Allocate minimum CCtx workspace to bound max_chunks
     var small_ws: [@sizeOf(ZSTD_CCtx) + 1024]u8 = undefined;
-    var d_ws: [128 * 1024]u8 = undefined;
+    var d_ws: [ZSTD_estimateDCtxSize()]u8 align(@alignOf(ZSTD_DCtx)) = undefined;
 
     const cctx = (try ZSTD_CCtx.init(&small_ws));
     const dctx = (try ZSTD_DCtx.init(&d_ws));
@@ -499,7 +496,7 @@ test "zstd chunk buffer exhaustion falls back to raw block and avoids silent tru
 
 test "zstd frame header accounting triggers raw fallback when total frame expands past src.len" {
     var c_ws: [128 * 1024]u8 = undefined;
-    var d_ws: [128 * 1024]u8 = undefined;
+    var d_ws: [ZSTD_estimateDCtxSize()]u8 align(@alignOf(ZSTD_DCtx)) = undefined;
 
     const cctx = (try ZSTD_CCtx.init(&c_ws));
     const dctx = (try ZSTD_DCtx.init(&d_ws));
@@ -531,7 +528,7 @@ test "zstd frame header accounting triggers raw fallback when total frame expand
 
 test "zstd edge cases: small payloads and compression threshold boundary" {
     var c_ws: [128 * 1024]u8 = undefined;
-    var d_ws: [128 * 1024]u8 = undefined;
+    var d_ws: [ZSTD_estimateDCtxSize()]u8 align(@alignOf(ZSTD_DCtx)) = undefined;
 
     const cctx = (try ZSTD_CCtx.init(&c_ws));
     const dctx = (try ZSTD_DCtx.init(&d_ws));
