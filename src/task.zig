@@ -275,6 +275,43 @@ pub const Scheduler = struct {
         return null;
     }
 
+    /// Reactivate cold stack pages of a scheduled task so its active stack is not evicted
+    pub fn reactivateTaskStack(self: *Scheduler, task: *Task) void {
+        const eff_pmm: ?*memory.PhysicalMemoryManager = self.pmm orelse (if (builtin.os.tag == .freestanding) &memory.global_pmm else null);
+        var p: usize = 0;
+        while (p < task.stack_page_count) : (p += 1) {
+            var page = &task.managed_stack_pages[p];
+            if (page.isCold()) {
+                _ = page.markActive(eff_pmm);
+            }
+        }
+    }
+
+    /// Lightweight heuristic loop: marks non-running tasks' stack pages cold and pushes them to
+    /// global_ring.enqueueManagedPage, connecting the scheduler to the eviction engine.
+    pub fn enqueueColdTaskStacks(self: *Scheduler) void {
+        if (!ring.global_ring.initialized) return;
+        const eff_pmm: ?*memory.PhysicalMemoryManager = self.pmm orelse (if (builtin.os.tag == .freestanding) &memory.global_pmm else null);
+        const pmm = eff_pmm orelse return;
+
+        const cur_id = self.current_task_id;
+        for (&self.tasks) |*t| {
+            if (t.state != .unused and (cur_id == null or t.id != cur_id.?) and (t.state == .ready or t.state == .suspended)) {
+                var p: usize = 0;
+                while (p < t.stack_page_count) : (p += 1) {
+                    var page = &t.managed_stack_pages[p];
+                    if (page.isActive()) {
+                        if (page.markCold(pmm)) {
+                            if (!ring.global_ring.enqueueManagedPage(page)) {
+                                _ = page.markActive(pmm);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Yield execution cooperatively to the next ready task.
     /// Strictly maintains Law of the Single Flat Space: switches registers only,
     /// no TTBR0/1 or TLB flushes.
@@ -294,6 +331,12 @@ pub const Scheduler = struct {
         next.state = .running;
         self.current_task_id = next.id;
         self.switch_count += 1;
+
+        // Reactivate scheduled task stack pages
+        self.reactivateTaskStack(next);
+
+        // Lightweight heuristic loop: mark non-running tasks' stack pages cold and enqueue to global_ring
+        self.enqueueColdTaskStacks();
 
         if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .freestanding) {
             const switch_fn: *const fn (*TaskContext, *const TaskContext) callconv(.C) void = @ptrCast(&switchContext);
@@ -364,6 +407,8 @@ pub const Scheduler = struct {
             next.state = .running;
             self.current_task_id = next.id;
             self.switch_count += 1;
+            self.reactivateTaskStack(next);
+            self.enqueueColdTaskStacks();
             loadContext(&next.context);
         } else {
             // No ready tasks left: return to primary task if not terminated or hang in idle loop
