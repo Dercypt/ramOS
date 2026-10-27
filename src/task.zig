@@ -300,7 +300,12 @@ pub const Scheduler = struct {
                 var p: usize = 0;
                 while (p < t.stack_page_count) : (p += 1) {
                     var page = &t.managed_stack_pages[p];
-                    if (page.isActive()) {
+                    if (page.in_ring) {
+                        // Guard against duplicate ring flooding: page is already queued in global_ring
+                        if (page.isActive()) {
+                            _ = page.markCold(pmm);
+                        }
+                    } else if (page.isActive()) {
                         if (page.markCold(pmm)) {
                             if (!ring.global_ring.enqueueManagedPage(page)) {
                                 _ = page.markActive(pmm);
@@ -988,6 +993,60 @@ test "Scheduler.yield enqueues non-running task stack pages into global_ring" {
     // Task 1 was yielding (now ready), so its stack pages must be marked cold and enqueued
     try std.testing.expect(task1.managed_stack_pages[0].isCold());
     // global_ring now contains task 2's old enqueued pages + task 1's newly enqueued pages
+    try std.testing.expectEqual(STACK_PAGE_COUNT * 2, ring.global_ring.getCount());
+
+    // Repeated yields between tasks must not flood the ring with duplicate entries
+    var y: usize = 0;
+    while (y < 20) : (y += 1) {
+        sched.yield();
+    }
+    try std.testing.expectEqual(STACK_PAGE_COUNT * 2, ring.global_ring.getCount());
+}
+
+test "Scheduler.yield prevents duplicate ring flooding across 100 yields" {
+    const limine = @import("limine.zig");
+    const mock_ram_size: usize = 4 * 1024 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+    pmm.init(base_addr, &mock_mmap);
+
+    var ring_slots: [32]ring.RingSlot = undefined;
+    ring.global_ring.initWithBuffer(&ring_slots);
+    defer ring.global_ring.initialized = false;
+
+    var sched: Scheduler = .{};
+    sched.init();
+
+    const dummyEntry = struct {
+        fn run(arg: u64) void {
+            _ = arg;
+        }
+    }.run;
+
+    _ = sched.spawn(&pmm, dummyEntry, 10, "worker_1") orelse return error.TestUnexpectedResult;
+    _ = sched.spawn(&pmm, dummyEntry, 20, "worker_2") orelse return error.TestUnexpectedResult;
+
+    // Yield 100 times without memory pressure
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        sched.yield();
+    }
+
+    // With in_ring guard, ring count never exceeds 2 tasks * STACK_PAGE_COUNT = 16 entries (does not overflow capacity 32)
     try std.testing.expectEqual(STACK_PAGE_COUNT * 2, ring.global_ring.getCount());
 }
 

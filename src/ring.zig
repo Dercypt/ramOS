@@ -42,6 +42,7 @@ pub const ManagedPage = struct {
     handle: slab.PageHandle = slab.PageHandle.invalid,
     compressed_size: u32 = 0,
     access_count: u32 = 0,
+    in_ring: bool = false,
 
     pub const invalid: ManagedPage = .{};
 
@@ -53,6 +54,7 @@ pub const ManagedPage = struct {
             .handle = slab.PageHandle.invalid,
             .compressed_size = 0,
             .access_count = 1,
+            .in_ring = false,
         };
     }
 
@@ -217,6 +219,7 @@ pub const ManagedPage = struct {
         self.phys_addr = 0;
         self.handle = slab.PageHandle.invalid;
         self.compressed_size = 0;
+        self.in_ring = false;
     }
 };
 
@@ -325,6 +328,9 @@ pub const CompressionRing = struct {
                     pos = actual;
                 } else {
                     const entry = slot.entry;
+                    if (entry.managed_page) |mp| {
+                        mp.in_ring = false;
+                    }
                     dmb();
                     @atomicStore(usize, &slot.sequence, pos +% self.capacity, .release);
                     _ = @atomicRmw(usize, &self.count, .Sub, 1, .monotonic);
@@ -340,8 +346,9 @@ pub const CompressionRing = struct {
 
     /// Enqueue a candidate ManagedPage
     pub fn enqueueManagedPage(self: *CompressionRing, page: *ManagedPage) bool {
+        if (page.in_ring) return false;
         const frame_idx = page.phys_addr / memory.PAGE_SIZE;
-        return self.enqueue(.{
+        const success = self.enqueue(.{
             .frame_idx = frame_idx,
             .phys_addr = page.phys_addr,
             .handle = slab.PageHandle.invalid,
@@ -350,6 +357,10 @@ pub const CompressionRing = struct {
             .status = .pending,
             .sequence = @intCast(self.total_enqueued),
         });
+        if (success) {
+            page.in_ring = true;
+        }
+        return success;
     }
 
     pub fn getCount(self: *const CompressionRing) usize {
@@ -389,6 +400,7 @@ pub const CompressionRing = struct {
                     continue;
                 }
                 // Slab exhaustion: preserve entry in ring to prevent orphaning cold page
+                mp.in_ring = true;
                 _ = self.enqueue(entry);
                 return null;
             };
