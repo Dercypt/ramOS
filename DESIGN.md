@@ -88,6 +88,7 @@ To prevent memory allocation deadlocks when memory is scarce, compression operat
    - Terminated tasks defer stack deallocation to `reclaimZombie` executed on the next scheduled task context, recycling the slot to `.unused` without leaking task slots.
    - To eliminate kernel `.bss` bloating, `Scheduler` gates mock test stacks (`static_stacks: [MAX_TASKS][16 KiB]u8`, 1 MiB) behind `builtin.is_test`, allocating only a single 16 KiB `idle_stack` for freestanding kernel context switching.
    - **Eviction Loop Integration:** During `Scheduler.yield`, non-running tasks (`.ready` or `.suspended`) have their active stack pages marked cold via `enqueueColdTaskStacks()` and pushed to `ring.global_ring.enqueueManagedPage`. When free physical memory drops below `watermark_low`, `allocContiguousFrames` triggers synchronous Zstd compression eviction on these enqueued cold pages, replenishing physical frames. When a task is scheduled to run, `reactivateTaskStack()` reactivates its cold stack pages to prevent in-flight stack corruption.
+   - **Worker Draining & Wraparound Coordination:** In cooperative round-robin scheduling, when later task slots terminate and exit, circular search wraps around to slot 0 (`kernel_main`) before earlier ready tasks execute subsequent turns. Primary tasks awaiting the termination of spawned worker tasks must loop yielding while `Scheduler.getTaskCount() > 1`, ensuring all worker green threads drain completely before self-test assertions or dependent kernel routines proceed.
 
 ---
 
