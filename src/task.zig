@@ -681,6 +681,65 @@ test "round-robin task selection on exit resumes next ready task in circular ord
     try std.testing.expectEqual(@as(TaskId, 0), next_after_t2.?.id);
 }
 
+test "round-robin wraparound requires loop to drain all worker tasks before primary continues" {
+    var sched: Scheduler = .{};
+    sched.init();
+
+    const dummyEntry = struct {
+        fn run(arg: u64) void {
+            _ = arg;
+        }
+    }.run;
+
+    const t1 = sched.spawnStatic(dummyEntry, 100, "worker_a") orelse return error.TestUnexpectedResult;
+    const t2 = sched.spawnStatic(dummyEntry, 200, "worker_b") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(@as(usize, 3), sched.getTaskCount());
+
+    // 1. Primary task (slot 0) yields -> round-robin selects t1 (slot 1)
+    sched.yield();
+    try std.testing.expectEqual(@as(?TaskId, t1), sched.current_task_id);
+
+    // 2. Worker A yields mid-execution -> round-robin selects t2 (slot 2)
+    sched.yield();
+    try std.testing.expectEqual(@as(?TaskId, t2), sched.current_task_id);
+
+    // 3. Worker B completes and exits
+    sched.getTaskById(t2).?.state = .terminated;
+    sched.task_count -= 1;
+    const next_after_b = sched.findNextReadyTask(t2);
+    try std.testing.expect(next_after_b != null);
+    // Circular search starting after slot 2 wraps around to slot 0 (kernel_main)
+    try std.testing.expectEqual(@as(TaskId, 0), next_after_b.?.id);
+
+    // Context switch to next_after_b (slot 0)
+    sched.current_task_id = 0;
+    sched.getTaskById(0).?.state = .running;
+
+    // At this point, worker A (t1) is still ready, task_count is 2 (> 1)
+    try std.testing.expectEqual(@as(usize, 2), sched.getTaskCount());
+    try std.testing.expectEqual(TaskState.ready, sched.getTaskById(t1).?.state);
+
+    // 4. Primary yields again because getTaskCount() > 1
+    sched.yield();
+    // Round-robin from slot 0 selects t1 (slot 1)
+    try std.testing.expectEqual(@as(?TaskId, t1), sched.current_task_id);
+
+    // 5. Worker A completes its second turn and exits
+    sched.getTaskById(t1).?.state = .terminated;
+    sched.task_count -= 1;
+    const next_after_a = sched.findNextReadyTask(t1);
+    try std.testing.expect(next_after_a != null);
+    try std.testing.expectEqual(@as(TaskId, 0), next_after_a.?.id);
+
+    // Return to primary task (slot 0)
+    sched.current_task_id = 0;
+    sched.getTaskById(0).?.state = .running;
+
+    // Both workers have completed; task_count is now 1
+    try std.testing.expectEqual(@as(usize, 1), sched.getTaskCount());
+}
+
 test "round-robin exit wraps around task table boundary and handles empty ready set" {
     var sched: Scheduler = .{};
     sched.init();
