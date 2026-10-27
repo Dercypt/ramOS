@@ -416,8 +416,13 @@ fn testTaskSwitcher() void {
     if ((t1.context.sp & 15) != 0 or (t2.context.sp & 15) != 0) @panic("Worker stack pointers misaligned");
 
     // 3. Test cooperative context switching
-    // Yielding from primary task (kernel_main) switches execution to workerTaskA
-    task.global_scheduler.yield();
+    // Yield from primary task (kernel_main) until all spawned worker tasks have completed and exited.
+    // In circular round-robin scheduling, workerTaskB (slot 2) may complete and exit, wrapping
+    // around to slot 0 (kernel_main) before workerTaskA (slot 1) receives its second turn.
+    // Looping while getTaskCount() > 1 guarantees that all worker tasks drain completely before assertions run.
+    while (task.global_scheduler.getTaskCount() > 1) {
+        task.global_scheduler.yield();
+    }
 
     // After round-robin execution through workers and back to primary:
     // workerTaskA added 100, yielded to workerTaskB which added 200 and completed,
