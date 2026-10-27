@@ -318,6 +318,21 @@ pub const PhysicalMemoryManager = struct {
         self.freeContiguousFrames(phys, 1);
     }
 
+    /// Allocate or reclaim a specific physical frame by its physical address.
+    /// If the frame is currently marked free, it marks it active, decrements free_frames,
+    /// and sets ref_count to 1.
+    pub fn claimFrame(self: *PhysicalMemoryManager, phys: u64) bool {
+        const frame_idx = phys / PAGE_SIZE;
+        if (frame_idx >= self.max_frames) return false;
+        if (!self.isBitSet(frame_idx)) {
+            self.setBit(frame_idx, true);
+            self.free_frames -= 1;
+            self.frame_table[frame_idx].ref_count = 1;
+        }
+        self.frame_table[frame_idx].state = .active;
+        return true;
+    }
+
     pub fn isLowMemory(self: *const PhysicalMemoryManager) bool {
         return self.free_frames <= self.watermark_low;
     }
