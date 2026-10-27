@@ -150,6 +150,10 @@ pub const Scheduler = struct {
         return self.switch_count;
     }
 
+    pub fn setSlabAllocator(self: *Scheduler, slab_alloc: *memory.slab.SlabAllocator) void {
+        self.slab_alloc = slab_alloc;
+    }
+
     /// Spawn a new task using the PhysicalMemoryManager for stack allocation
     pub fn spawn(
         self: *Scheduler,
@@ -168,6 +172,9 @@ pub const Scheduler = struct {
         }
         const idx = slot_idx orelse return null;
         self.pmm = pmm;
+        if (self.slab_alloc == null and builtin.os.tag == .freestanding) {
+            self.slab_alloc = &memory.slab.global_slab;
+        }
 
         // Allocate physical frames for stack
         const stack_phys = pmm.allocContiguousFrames(STACK_PAGE_COUNT, 1) orelse return null;
@@ -275,14 +282,21 @@ pub const Scheduler = struct {
         return null;
     }
 
-    /// Reactivate cold stack pages of a scheduled task so its active stack is not evicted
+    /// Reactivate cold or compressed stack pages of a scheduled task so its active stack is not evicted
+    /// or jumping onto a freed physical frame (preventing Use-After-Free). Under the Law of the Single
+    /// Flat Space, stacks are decompressed synchronously back into their original physical frames.
     pub fn reactivateTaskStack(self: *Scheduler, task: *Task) void {
         const eff_pmm: ?*memory.PhysicalMemoryManager = self.pmm orelse (if (builtin.os.tag == .freestanding) &memory.global_pmm else null);
+        const eff_slab: ?*memory.slab.SlabAllocator = self.slab_alloc orelse (if (builtin.os.tag == .freestanding) &memory.slab.global_slab else null);
         var p: usize = 0;
         while (p < task.stack_page_count) : (p += 1) {
             var page = &task.managed_stack_pages[p];
             if (page.isCold()) {
                 _ = page.markActive(eff_pmm);
+            } else if (page.isCompressed()) {
+                if (eff_pmm != null and eff_slab != null) {
+                    _ = page.decompressToOriginalFrame(eff_pmm.?, eff_slab.?) catch {};
+                }
             }
         }
     }
@@ -1132,7 +1146,27 @@ test "Live eviction loop compresses cold task stack pages when watermark breache
 
     // Eviction loop successfully evicted cold pages into the slab pool
     try std.testing.expect(ring.global_ring.total_evicted > initial_evicted);
+    try std.testing.expect(task1.managed_stack_pages[0].isCompressed());
+    try std.testing.expectEqual(@as(u64, 0), task1.managed_stack_pages[0].phys_addr);
     pmm.freeContiguousFrames(frame.?, 2);
+
+    // Yield back around to task 1 (task 2 -> task 0 -> task 1):
+    // reactivateTaskStack must safely decompress the evicted stack pages
+    // back into their original physical frames before resuming execution, preventing Use-After-Free
+    // under the Law of the Single Flat Space.
+    sched.slab_alloc = &slab_alloc;
+    sched.yield(); // task 2 -> task 0 (kernel_main)
+    try std.testing.expectEqual(@as(?TaskId, 0), sched.current_task_id);
+
+    sched.yield(); // task 0 -> task 1 (worker_1)
+    try std.testing.expectEqual(@as(?TaskId, t1), sched.current_task_id);
+    try std.testing.expect(task1.managed_stack_pages[0].isActive());
+    try std.testing.expectEqual(task1.stack_base_phys, task1.managed_stack_pages[0].phys_addr);
+
+    // Verify stack contents are preserved byte-for-byte in the exact original physical frames
+    const restored_virt: [*]const u8 = pmm.physToVirt(task1.managed_stack_pages[0].phys_addr);
+    try std.testing.expectEqual(@as(u8, 'S'), restored_virt[0]);
+    try std.testing.expectEqual(@as(u8, 'S'), restored_virt[memory.PAGE_SIZE - 1]);
 }
 
 test "Scheduler.yield handles uninitialized or full compression ring gracefully" {
