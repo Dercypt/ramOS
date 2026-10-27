@@ -95,3 +95,9 @@ zig build test
 - [DESIGN.md](DESIGN.md): Architectural specification, memory topology, page lifecycle state machine, and scheduling models.
 - [HARNESS.md](HARNESS.md): Governance harness specification.
 - [AGENTS.md](AGENTS.md): Operational directives for AI agents modifying this repository.
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

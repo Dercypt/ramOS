@@ -39,9 +39,11 @@ pub const RingSlot = struct {
 pub const ManagedPage = struct {
     state: memory.PageState = .free,
     phys_addr: u64 = 0,
+    orig_phys_addr: u64 = 0,
     handle: slab.PageHandle = slab.PageHandle.invalid,
     compressed_size: u32 = 0,
     access_count: u32 = 0,
+    in_ring: bool = false,
 
     pub const invalid: ManagedPage = .{};
 
@@ -50,9 +52,11 @@ pub const ManagedPage = struct {
         return .{
             .state = .active,
             .phys_addr = phys_addr,
+            .orig_phys_addr = phys_addr,
             .handle = slab.PageHandle.invalid,
             .compressed_size = 0,
             .access_count = 1,
+            .in_ring = false,
         };
     }
 
@@ -127,6 +131,9 @@ pub const ManagedPage = struct {
 
         // Return uncompressed physical frame to PMM free pool
         const old_phys = self.phys_addr;
+        if (self.orig_phys_addr == 0) {
+            self.orig_phys_addr = old_phys;
+        }
         pmm.freeFrame(old_phys);
 
         self.handle = handle;
@@ -198,6 +205,59 @@ pub const ManagedPage = struct {
         return error.InvalidPageState;
     }
 
+    /// Synchronously decompress this compressed page back into its original physical frame.
+    /// Under the Law of the Single Flat Space, live stack pointers hold direct HHDM virtual
+    /// addresses, so stacks must be restored to their original physical frames without relocation.
+    pub fn decompressToOriginalFrame(
+        self: *ManagedPage,
+        pmm: *memory.PhysicalMemoryManager,
+        slab_alloc: *slab.SlabAllocator,
+    ) ![*]u8 {
+        if (self.state != .compressed) return error.InvalidPageState;
+        if (!self.handle.isValid()) return error.InvalidHandle;
+
+        const target_phys = self.orig_phys_addr;
+        if (target_phys == 0) return error.InvalidAddress;
+
+        self.state = .decompressing;
+
+        // Reclaim original physical frame in PMM
+        if (!pmm.claimFrame(target_phys)) {
+            self.state = .compressed;
+            return error.OutOfMemory;
+        }
+
+        const virt: [*]u8 = pmm.physToVirt(target_phys);
+        const frame_slice = virt[0..memory.PAGE_SIZE];
+
+        const decomp_len = slab_alloc.decompressToFrame(self.handle, frame_slice) catch |err| {
+            self.state = .compressed;
+            return err;
+        };
+
+        if (decomp_len != memory.PAGE_SIZE) {
+            self.state = .compressed;
+            return error.DecompressionLengthMismatch;
+        }
+
+        // Free compressed slab payload
+        slab_alloc.freeCompressed(self.handle);
+
+        self.phys_addr = target_phys;
+        self.handle = slab.PageHandle.invalid;
+        self.compressed_size = 0;
+        self.state = .active;
+        self.access_count += 1;
+        self.in_ring = false;
+
+        const frame_idx = target_phys / memory.PAGE_SIZE;
+        if (frame_idx < pmm.max_frames) {
+            pmm.frame_table[frame_idx].state = .active;
+        }
+
+        return virt;
+    }
+
     /// Deallocate this page, freeing either its physical frame or compressed slab payload
     pub fn deallocate(
         self: *ManagedPage,
@@ -215,8 +275,10 @@ pub const ManagedPage = struct {
         }
         self.state = .free;
         self.phys_addr = 0;
+        self.orig_phys_addr = 0;
         self.handle = slab.PageHandle.invalid;
         self.compressed_size = 0;
+        self.in_ring = false;
     }
 };
 
@@ -325,6 +387,9 @@ pub const CompressionRing = struct {
                     pos = actual;
                 } else {
                     const entry = slot.entry;
+                    if (entry.managed_page) |mp| {
+                        mp.in_ring = false;
+                    }
                     dmb();
                     @atomicStore(usize, &slot.sequence, pos +% self.capacity, .release);
                     _ = @atomicRmw(usize, &self.count, .Sub, 1, .monotonic);
@@ -340,8 +405,9 @@ pub const CompressionRing = struct {
 
     /// Enqueue a candidate ManagedPage
     pub fn enqueueManagedPage(self: *CompressionRing, page: *ManagedPage) bool {
+        if (page.in_ring) return false;
         const frame_idx = page.phys_addr / memory.PAGE_SIZE;
-        return self.enqueue(.{
+        const success = self.enqueue(.{
             .frame_idx = frame_idx,
             .phys_addr = page.phys_addr,
             .handle = slab.PageHandle.invalid,
@@ -350,6 +416,10 @@ pub const CompressionRing = struct {
             .status = .pending,
             .sequence = @intCast(self.total_enqueued),
         });
+        if (success) {
+            page.in_ring = true;
+        }
+        return success;
     }
 
     pub fn getCount(self: *const CompressionRing) usize {
@@ -389,6 +459,7 @@ pub const CompressionRing = struct {
                     continue;
                 }
                 // Slab exhaustion: preserve entry in ring to prevent orphaning cold page
+                mp.in_ring = true;
                 _ = self.enqueue(entry);
                 return null;
             };
@@ -1220,4 +1291,56 @@ test "CompressionRing stores slots as bounded slice for software-enforced isolat
     try std.testing.expectEqual(@TypeOf(ring.slots), []RingSlot);
     try std.testing.expectEqual(ring.capacity, ring.slots.len);
     try std.testing.expectEqual(@as(usize, 8), ring.slots.len);
+}
+
+test "ManagedPage.decompressToOriginalFrame restores page into original physical address" {
+    const mock_ram_size: usize = 2 * 1024 * 1024;
+    var mock_ram: [mock_ram_size]u8 align(64 * 1024) = undefined;
+    @memset(&mock_ram, 0);
+
+    const base_addr = @as(usize, @intFromPtr(&mock_ram[0]));
+    var pmm: memory.PhysicalMemoryManager = .{};
+    var mmap_entry = std.mem.zeroes(limine.MemoryMapEntry);
+    mmap_entry.base = 0;
+    mmap_entry.length = mock_ram_size;
+    mmap_entry.type = .usable;
+
+    var entry_ptrs = [_]*limine.MemoryMapEntry{&mmap_entry};
+    const mock_mmap = limine.MemoryMapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = &entry_ptrs,
+    };
+    pmm.init(base_addr, &mock_mmap);
+
+    var slab_alloc: slab.SlabAllocator = .{};
+    slab_alloc.init(&pmm);
+
+    const warmup = slab_alloc.allocCompressed("warmup") orelse return error.TestUnexpectedResult;
+    slab_alloc.freeCompressed(warmup);
+
+    const orig_phys = pmm.allocFrame() orelse return error.TestUnexpectedResult;
+    const virt: [*]u8 = pmm.physToVirt(orig_phys);
+    @memset(virt[0..memory.PAGE_SIZE], 0x42);
+
+    var page = ManagedPage.initActive(orig_phys);
+    try std.testing.expectEqual(orig_phys, page.orig_phys_addr);
+    _ = page.markCold(&pmm);
+
+    // Compress page into slab pool; underlying physical frame is freed
+    const handle = try page.compress(&pmm, &slab_alloc);
+    try std.testing.expect(page.isCompressed());
+    try std.testing.expectEqual(@as(u64, 0), page.phys_addr);
+    try std.testing.expectEqual(orig_phys, page.orig_phys_addr);
+    try std.testing.expect(handle.isValid());
+
+    // Decompress back into original physical frame
+    const restored_virt = try page.decompressToOriginalFrame(&pmm, &slab_alloc);
+    try std.testing.expect(page.isActive());
+    try std.testing.expectEqual(orig_phys, page.phys_addr);
+    try std.testing.expectEqual(@as([*]u8, pmm.physToVirt(orig_phys)), restored_virt);
+    try std.testing.expectEqual(@as(u8, 0x42), restored_virt[0]);
+    try std.testing.expectEqual(@as(u8, 0x42), restored_virt[memory.PAGE_SIZE - 1]);
+
+    page.deallocate(&pmm, &slab_alloc);
 }
